@@ -52,7 +52,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULTS_CSV = DATA_DIR / "prakriti_results.csv"
-ADMIN_PIN = "1234"  # change if needed
+ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234")
+# change if needed
 
 # --- Footer text for PDF reports (your final details) ---
 FOOTER_TEXT = "Kakunje Ayurveda Clinic & Research Centre · Moodubidri, Karnataka, India · +91-9483697676 · kakunje.com · prasanna@kakunje.com"
