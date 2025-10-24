@@ -1,19 +1,12 @@
-# prakriti_app_pdf_v6.py — Prakriti Analyzer (Weighted, 15 Qs, PDF, Location + Usage Analytics)
-# Brand: Kakunje Ayurveda Clinic & Research Centre
-# -----------------------------------------------------------------------
-# New in v6:
-#  • Optional location fields (country/state/city) with explicit consent
-#  • Usage logging (app_open, assessment_submitted, pdf_downloaded)
-#  • Admin: Usage Analytics (top countries, per-day counts, quick metrics)
-#  • Reads ADMIN_PIN from secrets
-# Existing features kept:
-#  • 15 clear questions, weighted
-#  • Safe CSV writes; pandas-version-proof groupby
-#  • PDF with logo header, footer, note, tips, disclaimer
-#  • Streamlit 2025+ safe (width='stretch')
-# -----------------------------------------------------------------------
+# prakriti_app_pdf_v5.py  (v6 merged into v5 filename)
+# Prakriti Analyzer — By Kakunje Ayurveda
+# - 15 clear questions (weighted)
+# - Location (country/state/city) + consented usage analytics
+# - Feedback form, Results CSV, Admin dashboard, PDF with logo, footer, note, tips, disclaimer
+# - Dual + Tridoshic advice supported
+# - Reads ADMIN_PIN from Streamlit Secrets (with local fallback)
 
-import os, time, io, warnings
+import os, io, time, warnings
 from pathlib import Path
 from datetime import datetime
 
@@ -22,241 +15,160 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# Optional (keeps console clean)
 warnings.filterwarnings("ignore")
 
-# PDF dependency
+# ---- PDF deps ----
 REPORTLAB_OK = True
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import cm
     from reportlab.platypus import (
-        SimpleDocTemplate,
-        Paragraph,
-        Spacer,
-        Image as RLImage,
-        Table,
-        TableStyle,
+        SimpleDocTemplate, Paragraph, Spacer, Image as RLImage,
+        Table, TableStyle
     )
     from reportlab.lib import colors
 except Exception:
     REPORTLAB_OK = False
 
 # -------------------------
-# CONFIG
+# CONFIG & PATHS
 # -------------------------
+st.set_page_config(page_title="Kakunje Prakriti App", layout="wide", page_icon="🪷")
+
 BRAND_TITLE = "Kakunje Ayurveda Clinic & Research Centre"
-LOGO_PATH = Path("logo.png")  # place your logo file in same folder
-DATA_DIR = Path("data")
+LOGO_PATH   = Path("logo.png")                           # keep logo.png next to this file
+DATA_DIR    = Path("data")
 REPORTS_DIR = DATA_DIR / "reports"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-RESULTS_CSV = DATA_DIR / "prakriti_results.csv"
-FEEDBACK_CSV = DATA_DIR / "feedback.csv"
+RESULTS_CSV   = DATA_DIR / "prakriti_results.csv"
+FEEDBACK_CSV  = DATA_DIR / "feedback.csv"
 USAGE_LOG_CSV = DATA_DIR / "usage_log.csv"
 
-# Read PIN from secrets; fallback only for local
+# Read from secrets in cloud; fallback for local runs
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234")
 
-# --- PDF footer text (final details) ---
-FOOTER_TEXT = "Kakunje Ayurveda Clinic & Research Centre · Moodubidri, Karnataka, India · +91-9483697676 · kakunje.com · prasanna@kakunje.com"
+FOOTER_TEXT = (
+    "Kakunje Ayurveda Clinic & Research Centre · Moodubidri, Karnataka, India · "
+    "+91-9483697676 · kakunje.com · prasanna@kakunje.com"
+)
 
-# Required columns (extended with location + consent; backward-compatible)
+# ---- Required columns (backward compatible) ----
 REQUIRED_COLS = [
-    "timestamp",
-    "person_key",
-    "attempt_no",
-    "name",
-    "age",
-    "gender",
-    "country",
-    "state",
-    "city",
-    "consent_analytics",
-    "vata_score",
-    "pitta_score",
-    "kapha_score",
-    "vata_%",
-    "pitta_%",
-    "kapha_%",
-    "type",
+    "timestamp","person_key","attempt_no","name","age","gender",
+    "country","state","city","consent_analytics",
+    "vata_score","pitta_score","kapha_score",
+    "vata_%","pitta_%","kapha_%","type"
 ]
 
-# intensity → base weights
+# ---- Question weights & labels ----
 INT_TO_WEIGHT = {
-    "Rarely": 0,
-    "Sometimes": 1,
-    "Often": 2,  # variable
-    "Low": 0,
-    "Moderate": 1,
-    "High": 2,  # psychological
-    "Mildly": 0,
-    "Moderately": 1,
-    "Strongly": 2,  # physical
+    "Rarely": 0, "Sometimes": 1, "Often": 2,           # variable
+    "Low": 0, "Moderate": 1, "High": 2,                # psychological
+    "Mildly": 0, "Moderately": 1, "Strongly": 2        # physical
 }
 
-# -------------------------
-# 15 QUESTIONS — clear, non-overlapping phrasing
-# Each: (question, {Vata,Pitta,Kapha}, category, weight)
-# -------------------------
 QUESTIONS = [
-    (
-        "Natural body build",
-        {
-            "Vata": "Thin/lean; hard to gain weight",
-            "Pitta": "Medium/muscular; moderate weight",
-            "Kapha": "Broad/heavier; gains easily",
-        },
-        "physical",
-        1.0,
-    ),
-    (
-        "Skin baseline (without products)",
-        {
-            "Vata": "Dry/rough/cool",
-            "Pitta": "Warm/sensitive; redness possible",
-            "Kapha": "Smooth/thick/oily",
-        },
-        "physical",
-        1.0,
-    ),
-    (
-        "Hair & scalp tendency",
-        {
-            "Vata": "Dry hair/scalp; frizz",
-            "Pitta": "Fine hair; early greying common",
-            "Kapha": "Thick/lustrous; oily scalp",
-        },
-        "physical",
-        0.8,
-    ),
-    (
-        "Appetite pattern (day to day)",
-        {
-            "Vata": "Irregular; sometimes low/sometimes high",
-            "Pitta": "Strong/sharp; hungry on time",
-            "Kapha": "Slow/steady; can skip meals",
-        },
-        "variable",
-        1.6,
-    ),
-    (
-        "Digestion / bowel pattern",
-        {
-            "Vata": "Variable; gas/bloating common",
-            "Pitta": "Fast; tendency to loose/acidic",
-            "Kapha": "Slower; well-formed stools",
-        },
-        "variable",
-        1.3,
-    ),
-    (
-        "Thirst & sweating",
-        {
-            "Vata": "Low thirst; minimal sweat",
-            "Pitta": "High thirst; profuse sweat",
-            "Kapha": "Moderate thirst; mild sweat",
-        },
-        "variable",
-        1.0,
-    ),
-    (
-        "Thermal comfort",
-        {
-            "Vata": "Prefers warmth; dislikes cold",
-            "Pitta": "Feels hot easily; prefers cool",
-            "Kapha": "Comfortable with cool; dislikes damp cold",
-        },
-        "physical",
-        0.9,
-    ),
-    (
-        "Sleep quality",
-        {
-            "Vata": "Light; wakes easily; mind active",
-            "Pitta": "Moderate; heat/dreams may disturb",
-            "Kapha": "Deep/heavy; longer duration",
-        },
-        "variable",
-        1.3,
-    ),
-    (
-        "Mental focus (typical)",
-        {
-            "Vata": "Quick ideas; distractible",
-            "Pitta": "Sharp focus; task-driven",
-            "Kapha": "Steady; slower but consistent",
-        },
-        "psychological",
-        1.5,
-    ),
-    (
-        "Emotional response under stress",
-        {
-            "Vata": "Worry/anxiety; overthinking",
-            "Pitta": "Irritability/anger; impatience",
-            "Kapha": "Withdrawal/attachment; lethargy",
-        },
-        "psychological",
-        1.4,
-    ),
-    (
-        "Speech & pace",
-        {
-            "Vata": "Fast/variable; animated",
-            "Pitta": "Clear/precise; firm",
-            "Kapha": "Slow/steady; calm",
-        },
-        "variable",
-        0.8,
-    ),
-    (
-        "Joints & movement",
-        {
-            "Vata": "Cracking/mobility; dryness",
-            "Pitta": "Warm; occasional tenderness",
-            "Kapha": "Stable/cushioned; less cracking",
-        },
-        "physical",
-        0.9,
-    ),
-    (
-        "Food preferences",
-        {
-            "Vata": "Warm, oily, grounding foods",
-            "Pitta": "Cooling/light foods; dislikes very spicy",
-            "Kapha": "Light/warm/spicy foods; dislikes heavy",
-        },
-        "variable",
-        1.0,
-    ),
-    (
-        "Weather preference",
-        {
-            "Vata": "Warm/dry climate",
-            "Pitta": "Cool/mild climate",
-            "Kapha": "Cold/dry climate with sunshine",
-        },
-        "variable",
-        0.7,
-    ),
-    (
-        "Typical energy pattern",
-        {
-            "Vata": "Variable energy; bursts and dips",
-            "Pitta": "Strong/consistent until late crash",
-            "Kapha": "Steady but slow; builds with activity",
-        },
-        "psychological",
-        1.2,
-    ),
+    ("Natural body build",
+     {"Vata": "Thin/lean; hard to gain weight",
+      "Pitta": "Medium/muscular; moderate weight",
+      "Kapha": "Broad/heavier; gains easily"},
+     "physical", 1.0),
+
+    ("Skin baseline (without products)",
+     {"Vata": "Dry/rough/cool",
+      "Pitta": "Warm/sensitive; redness possible",
+      "Kapha": "Smooth/thick/oily"},
+     "physical", 1.0),
+
+    ("Hair & scalp tendency",
+     {"Vata": "Dry hair/scalp; frizz",
+      "Pitta": "Fine hair; early greying common",
+      "Kapha": "Thick/lustrous; oily scalp"},
+     "physical", 0.8),
+
+    ("Appetite pattern (day to day)",
+     {"Vata": "Irregular; sometimes low/sometimes high",
+      "Pitta": "Strong/sharp; hungry on time",
+      "Kapha": "Slow/steady; can skip meals"},
+     "variable", 1.6),
+
+    ("Digestion / bowel pattern",
+     {"Vata": "Variable; gas/bloating common",
+      "Pitta": "Fast; tendency to loose/acidic",
+      "Kapha": "Slower; well-formed stools"},
+     "variable", 1.3),
+
+    ("Thirst & sweating",
+     {"Vata": "Low thirst; minimal sweat",
+      "Pitta": "High thirst; profuse sweat",
+      "Kapha": "Moderate thirst; mild sweat"},
+     "variable", 1.0),
+
+    ("Thermal comfort",
+     {"Vata": "Prefers warmth; dislikes cold",
+      "Pitta": "Feels hot easily; prefers cool",
+      "Kapha": "Comfortable with cool; dislikes damp cold"},
+     "physical", 0.9),
+
+    ("Sleep quality",
+     {"Vata": "Light; wakes easily; mind active",
+      "Pitta": "Moderate; heat/dreams may disturb",
+      "Kapha": "Deep/heavy; longer duration"},
+     "variable", 1.3),
+
+    ("Mental focus (typical)",
+     {"Vata": "Quick ideas; distractible",
+      "Pitta": "Sharp focus; task-driven",
+      "Kapha": "Steady; slower but consistent"},
+     "psychological", 1.5),
+
+    ("Emotional response under stress",
+     {"Vata": "Worry/anxiety; overthinking",
+      "Pitta": "Irritability/anger; impatience",
+      "Kapha": "Withdrawal/attachment; lethargy"},
+     "psychological", 1.4),
+
+    ("Speech & pace",
+     {"Vata": "Fast/variable; animated",
+      "Pitta": "Clear/precise; firm",
+      "Kapha": "Slow/steady; calm"},
+     "variable", 0.8),
+
+    ("Joints & movement",
+     {"Vata": "Cracking/mobility; dryness",
+      "Pitta": "Warm; occasional tenderness",
+      "Kapha": "Stable/cushioned; less cracking"},
+     "physical", 0.9),
+
+    ("Food preferences",
+     {"Vata": "Warm, oily, grounding foods",
+      "Pitta": "Cooling/light foods; dislikes very spicy",
+      "Kapha": "Light/warm/spicy foods; dislikes heavy"},
+     "variable", 1.0),
+
+    ("Weather preference",
+     {"Vata": "Warm/dry climate",
+      "Pitta": "Cool/mild climate",
+      "Kapha": "Cold/dry climate with sunshine"},
+     "variable", 0.7),
+
+    ("Typical energy pattern",
+     {"Vata": "Variable energy; bursts and dips",
+      "Pitta": "Strong/consistent until late crash",
+      "Kapha": "Steady but slow; builds with activity"},
+     "psychological", 1.2),
 ]
 
+DISCLAIMER = (
+    "This assessment is educational and not a medical diagnosis. "
+    "Please consult a qualified Ayurveda physician for personalized advice and treatment."
+)
 
 # -------------------------
-# HELPERS
+# SMALL HELPERS
 # -------------------------
 def intensity_labels_for(category: str):
     if category == "variable":
@@ -265,15 +177,12 @@ def intensity_labels_for(category: str):
         return ["Low", "Moderate", "High"]
     return ["Mildly", "Moderately", "Strongly"]  # physical
 
-
 def person_key(name: str, age: int, gender: str) -> str:
     return f"{(name or '').strip().lower()}|{int(age or 0)}|{(gender or '').strip().lower()}"
-
 
 def percentify(scores: dict) -> dict:
     total = sum(scores.values()) or 1
     return {k: round(100 * v / total, 1) for k, v in scores.items()}
-
 
 def prakriti_type_from_percent(perc: dict) -> str:
     items = sorted(perc.items(), key=lambda x: x[1], reverse=True)
@@ -285,8 +194,7 @@ def prakriti_type_from_percent(perc: dict) -> str:
         return f"Dual ({items[0][0][0]}-{items[1][0][0]})"
     return f"Dominant {items[0][0]}"
 
-
-# Robust CSV IO
+# --- CSV IO (robust) ---
 def _flex_read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=REQUIRED_COLS)
@@ -294,7 +202,6 @@ def _flex_read_csv(path: Path) -> pd.DataFrame:
         return pd.read_csv(path, on_bad_lines="skip")
     except Exception:
         return pd.read_csv(path, sep=None, engine="python", on_bad_lines="skip")
-
 
 def _safe_write_csv(df: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,7 +221,6 @@ def _safe_write_csv(df: pd.DataFrame, path: Path) -> Path:
         except Exception:
             pass
 
-
 def load_results() -> pd.DataFrame:
     df = _flex_read_csv(RESULTS_CSV)
     for c in REQUIRED_COLS:
@@ -322,230 +228,226 @@ def load_results() -> pd.DataFrame:
             df[c] = np.nan
     df = df[REQUIRED_COLS].copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    for c in [
-        "vata_score",
-        "pitta_score",
-        "kapha_score",
-        "vata_%",
-        "pitta_%",
-        "kapha_%",
-        "age",
-        "attempt_no",
-    ]:
+    for c in ["vata_score","pitta_score","kapha_score","vata_%","pitta_%","kapha_%","age","attempt_no"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["name"] = df["name"].astype(str).str.strip().str.title()
+    df["name"]   = df["name"].astype(str).str.strip().str.title()
     df["gender"] = df["gender"].astype(str).str.strip().str.title()
-    for cc in ["country", "state", "city", "consent_analytics"]:
+    for cc in ["country","state","city","consent_analytics"]:
         df[cc] = df[cc].astype(str).replace({"nan": ""})
     df = df.dropna(subset=["timestamp"])
-    df = df.sort_values(["person_key", "timestamp"])
+    df = df.sort_values(["person_key","timestamp"])
     return df
 
-
 def save_result_row(row: dict):
-    # Load current
     current = load_results()
-    # Ensure row has all columns
     for c in REQUIRED_COLS:
         row.setdefault(c, None)
-    # New DF and coerce timestamp
     new = pd.DataFrame([row])
     new["timestamp"] = pd.to_datetime(new["timestamp"], errors="coerce")
-    # Append and coerce combined timestamp
     current = pd.concat([current, new], ignore_index=True)
     current["timestamp"] = pd.to_datetime(current["timestamp"], errors="coerce")
     current = current.dropna(subset=["timestamp"])
-    # Sort and reassign attempts
-    current = current.sort_values(["person_key", "timestamp"])
+    current = current.sort_values(["person_key","timestamp"])
 
     def reassign(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("timestamp")
         g["attempt_no"] = range(1, len(g) + 1)
         return g
 
-    # Compatible with old/new pandas
     try:
-        current = current.groupby(
-            "person_key", group_keys=False, include_groups=False
-        ).apply(reassign)
+        current = current.groupby("person_key", group_keys=False, include_groups=False).apply(reassign)
     except TypeError:
         current = current.groupby("person_key", group_keys=False).apply(reassign)
 
     _safe_write_csv(current, RESULTS_CSV)
 
+# -------------------------
+# DUAL/TRIDOSHA ADVICE
+# -------------------------
+def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
+    """
+    Tailored (note, tips) for Dominant, Dual (V-P, V-K, P-K), or Tridoshic.
+    ptype examples: "Dominant Vata", "Dual (V-P)", "Tridoshic (V-P-K)".
+    """
+    base = {
+        "Vata": {
+            "note": ("<b>Vata</b> qualities (light, dry, cool, mobile) are prominent. "
+                     "Support stability, warmth, and moisture with steady routines."),
+            "tips": [
+                "Prefer warm, cooked, moist foods with good oils; reduce cold, dry, raw foods.",
+                "Keep regular mealtimes and a consistent sleep–wake schedule.",
+                "Gentle grounding practices (abhyanga with warm oil, restorative yoga).",
+                "Protect from cold/dry weather; keep the body warm."
+            ]
+        },
+        "Pitta": {
+            "note": ("<b>Pitta</b> qualities (hot, sharp, intense) are prominent. "
+                     "Balance heat and intensity with cooling foods and calm routines."),
+            "tips": [
+                "Favor cooling tastes (sweet, bitter, astringent); limit very spicy/sour/salty.",
+                "Eat on time; make lunch the main meal; hydrate well.",
+                "Calming practices (prāṇāyāma, time in nature); avoid over-exertion.",
+                "Reduce late-night screens and overheating midday sun."
+            ]
+        },
+        "Kapha": {
+            "note": ("<b>Kapha</b> qualities (heavy, cool, stable) are prominent. "
+                     "Lightness, warmth, and stimulation help prevent sluggishness."),
+            "tips": [
+                "Favor light, warm, mildly spicy foods; reduce heavy, oily, very sweet foods.",
+                "Stay active daily (brisk walk, dynamic yoga); avoid daytime naps.",
+                "Supper light/early; include variety and stimulation in routine."
+            ]
+        }
+    }
+
+    def merge(*doshas):
+        notes = " & ".join(base[d]["note"] for d in doshas)
+        tips = []
+        for d in doshas:
+            tips += base[d]["tips"][:2]
+        # de-duplicate tips keeping order
+        seen, out = set(), []
+        for t in tips:
+            if t not in seen:
+                seen.add(t); out.append(t)
+        return notes, out
+
+    p = ptype.lower()
+    if p.startswith("tridoshic"):
+        note = ("Your Prakriti appears <b>Tridoshic</b>: Vata, Pitta and Kapha are relatively balanced. "
+                "Maintain balance with moderate routines, seasonal adjustments, and avoiding extremes.")
+        tips = [
+            "Eat fresh, mostly cooked food; vary by season (warmer/oilier in cold months, lighter/cooling in hot).",
+            "Keep regular meals and sleep; include daily movement without over- or under-doing it.",
+            "Notice early signs of imbalance (dryness/overthinking, heat/irritability, heaviness/slowness) and adjust diet/lifestyle accordingly."
+        ]
+        return note, tips
+
+    if p.startswith("dual"):
+        pair = ptype.split("(")[-1].strip(")").replace(" ", "")
+        d1i, d2i = pair.split("-")
+        m = {"V": "Vata", "P": "Pitta", "K": "Kapha"}
+        d1, d2 = m.get(d1i, d1i), m.get(d2i, d2i)
+        note, tips = merge(d1, d2)
+        note = f"Your Prakriti appears <b>Dual</b> — {d1} &amp; {d2}. {note}"
+        pair_key = "".join(sorted([d1[0], d2[0]]))  # "PV", "PK", "KV"
+        extra = {
+            "PV": "Choose warm but not overly heating foods; keep routines steady and cooling when needed.",
+            "PK": "Keep meals light/warm and mildly spicy; avoid very oily/heavy foods and excessive heat.",
+            "KV": "Go for warm, light meals with good oils and gentle spices; avoid cold/dry and very heavy foods."
+        }
+        if extra.get(pair_key):
+            tips.insert(0, extra[pair_key])
+        return note, tips
+
+    # Dominant fallback
+    if "vata" in p:
+        return ("Your Prakriti appears <b>Vata-dominant</b> — creative, quick, and adaptable. "
+                "Balance dryness, cold and variability with warm, moist foods and steady routines."),
+               base["Vata"]["tips"]
+    if "pitta" in p:
+        return ("Your Prakriti appears <b>Pitta-dominant</b> — energetic, focused, and driven. "
+                "Balance excess heat with cooling foods and calm routines."),
+               base["Pitta"]["tips"]
+    return ("Your Prakriti appears <b>Kapha-dominant</b> — steady, calm, and enduring. "
+            "Balance heaviness with warmth, lightness, and activity."),
+           base["Kapha"]["tips"]
 
 # -------------------------
-# PDF GENERATION
+# PDF
 # -------------------------
-def dominant_note_and_tips(perc: dict) -> tuple[str, list[str]]:
-    dom = max(perc, key=perc.get)
-    if dom == "Pitta":
-        note = (
-            "Your Prakriti appears to be <b>Pitta-dominant</b> — energetic, focused, "
-            "and driven. Balance excessive heat or irritability with cooling foods, "
-            "regular meals, adequate hydration, and calm routines."
-        )
-        tips = [
-            "Prefer cooling foods (sweet, bitter, astringent); reduce very spicy/sour/salty.",
-            "Avoid skipping meals; take lunch as main meal.",
-            "Practice calming activities (prāṇāyāma, gentle yoga, time in nature).",
-            "Keep work–rest balance; avoid overexertion and late-night screens.",
-        ]
-    elif dom == "Vata":
-        note = (
-            "Your Prakriti appears to be <b>Vata-dominant</b> — creative, quick, and adaptable. "
-            "Balance dryness, cold and variability with warm, moist foods and steady routines."
-        )
-        tips = [
-            "Prefer warm, cooked, moist foods with good oils; reduce raw, cold, dry foods.",
-            "Keep regular mealtimes and sleep schedule.",
-            "Gentle, grounding practices (abhyanga oil massage, restorative yoga).",
-            "Protect from cold/dry weather; keep the body warm.",
-        ]
-    else:  # Kapha
-        note = (
-            "Your Prakriti appears to be <b>Kapha-dominant</b> — steady, calm, and enduring. "
-            "Balance heaviness and sluggishness with warmth, lightness, and stimulation."
-        )
-        tips = [
-            "Favor light, warm, and mildly spicy foods; reduce heavy, oily, and sweet foods.",
-            "Stay active daily; brisk walking, dynamic yoga.",
-            "Avoid daytime sleep; take lighter dinners.",
-            "Keep variety and stimulation in routines to avoid lethargy.",
-        ]
-    return note, tips
-
-
-DISCLAIMER = (
-    "This assessment is educational and not a medical diagnosis. "
-    "Please consult a qualified Ayurveda physician for personalized advice and treatment."
-)
-
-
 def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
-    """
-    Build a single-page PDF with header (logo+title), footer (clinic info),
-    scores table, chart image, short interpretation, tips, and disclaimer.
-    """
     if not REPORTLAB_OK:
-        raise RuntimeError(
-            "ReportLab not installed. Install it with: pip install reportlab"
-        )
+        raise RuntimeError("ReportLab not installed (pip install reportlab)")
 
     buff = io.BytesIO()
     doc = SimpleDocTemplate(
-        buff,
-        pagesize=A4,
-        leftMargin=2 * cm,
-        rightMargin=2 * cm,
-        topMargin=2 * cm,
-        bottomMargin=1.5 * cm,
+        buff, pagesize=A4,
+        leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=1.5*cm
     )
     styles = getSampleStyleSheet()
     flow = []
 
-    # Header
-    def header(canvas, doc):
-        canvas.saveState()
+    # Header / Footer
+    def header(c, d):
         w, h = A4
+        c.saveState()
         if LOGO_PATH.exists():
             try:
-                canvas.drawImage(
-                    str(LOGO_PATH),
-                    w - 4.5 * cm,
-                    h - 3.5 * cm,
-                    width=3.5 * cm,
-                    height=3.5 * cm,
-                    preserveAspectRatio=True,
-                    mask="auto",
-                )
+                c.drawImage(str(LOGO_PATH), w - 4.5*cm, h - 3.5*cm,
+                            width=3.5*cm, height=3.5*cm, preserveAspectRatio=True, mask="auto")
             except Exception:
                 pass
-        canvas.setFont("Helvetica-Bold", 16)
-        canvas.drawString(2 * cm, h - 2.0 * cm, BRAND_TITLE)
-        canvas.setFont("Helvetica", 9)
-        canvas.drawString(
-            2 * cm, h - 2.6 * cm, "Prakriti Assessment Report (Educational)"
-        )
-        canvas.restoreState()
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(2*cm, h - 2.0*cm, BRAND_TITLE)
+        c.setFont("Helvetica", 9)
+        c.drawString(2*cm, h - 2.6*cm, "Prakriti Assessment Report (Educational)")
+        c.restoreState()
 
-    # Footer
-    def footer(canvas, doc):
+    def footer(c, d):
         w, h = A4
-        canvas.saveState()
-        canvas.setFont("Helvetica", 9)
-        canvas.drawCentredString(w / 2, 1.2 * cm, FOOTER_TEXT)
-        canvas.restoreState()
+        c.saveState()
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(w/2, 1.2*cm, FOOTER_TEXT)
+        c.restoreState()
 
-    def page_decor(canvas, doc):
-        header(canvas, doc)
-        footer(canvas, doc)
+    def page_decor(c, d):
+        header(c, d); footer(c, d)
 
-    # Body
-    flow.append(Spacer(1, 2.2 * cm))
+    flow.append(Spacer(1, 2.2*cm))
 
-    # Location line (compact)
-    loc_parts = [
-        x
-        for x in [row.get("city", ""), row.get("state", ""), row.get("country", "")]
-        if x
-    ]
-    loc_line = ", ".join(loc_parts) if loc_parts else "—"
+    # Compact location line
+    loc = ", ".join([x for x in [row.get("city",""), row.get("state",""), row.get("country","")] if x]) or "—"
 
     meta = [
-        ["Name", row.get("name", "")],
-        ["Age", str(row.get("age", ""))],
-        ["Gender", row.get("gender", "")],
-        ["Location", loc_line],
-        ["Date/Time", row.get("timestamp", "")],
-        ["Attempt #", str(row.get("attempt_no", ""))],
-        ["Type (heuristic)", row.get("type", "")],
+        ["Name", row.get("name","")],
+        ["Age", str(row.get("age",""))],
+        ["Gender", row.get("gender","")],
+        ["Location", loc],
+        ["Date/Time", row.get("timestamp","")],
+        ["Attempt #", str(row.get("attempt_no",""))],
+        ["Type (heuristic)", row.get("type","")],
     ]
-    t = Table(meta, hAlign="LEFT", colWidths=[4.0 * cm, 10.5 * cm])
-    t.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (1, 0), colors.whitesmoke),
-                ("BOX", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("FONT", (0, 0), (-1, -1), "Helvetica", 10),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.whitesmoke]),
-            ]
-        )
-    )
-    flow += [t, Spacer(1, 0.5 * cm)]
+    t = Table(meta, hAlign="LEFT", colWidths=[4.0*cm, 10.5*cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(1,0), colors.whitesmoke),
+        ("BOX",(0,0),(-1,-1), 0.25, colors.grey),
+        ("INNERGRID",(0,0),(-1,-1), 0.25, colors.grey),
+        ("FONT",(0,0),(-1,-1),"Helvetica", 10),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.white, colors.whitesmoke]),
+    ]))
+    flow += [t, Spacer(1, 0.5*cm)]
 
     scores_tbl = [
         ["Dosha", "Weighted Score", "Percent"],
-        ["Vata", f"{row['vata_score']}", f"{perc['Vata']} %"],
+        ["Vata",  f"{row['vata_score']}",  f"{perc['Vata']} %"],
         ["Pitta", f"{row['pitta_score']}", f"{perc['Pitta']} %"],
         ["Kapha", f"{row['kapha_score']}", f"{perc['Kapha']} %"],
     ]
-    stbl = Table(scores_tbl, hAlign="LEFT", colWidths=[3 * cm, 5 * cm, 5 * cm])
-    stbl.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-                ("BOX", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("FONT", (0, 0), (-1, -1), "Helvetica", 10),
-            ]
-        )
-    )
-    flow += [stbl, Spacer(1, 0.6 * cm)]
+    stbl = Table(scores_tbl, hAlign="LEFT", colWidths=[3*cm, 5*cm, 5*cm])
+    stbl.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), colors.lightgrey),
+        ("BOX",(0,0),(-1,-1), 0.25, colors.grey),
+        ("INNERGRID",(0,0),(-1,-1), 0.25, colors.grey),
+        ("FONT",(0,0),(-1,-1),"Helvetica", 10),
+    ]))
+    flow += [stbl, Spacer(1, 0.6*cm)]
 
     if chart_png and chart_png.exists():
-        flow.append(RLImage(str(chart_png), width=12 * cm, height=7 * cm))
-        flow.append(Spacer(1, 0.6 * cm))
+        flow.append(RLImage(str(chart_png), width=12*cm, height=7*cm))
+        flow.append(Spacer(1, 0.6*cm))
 
-    note, tips = dominant_note_and_tips(perc)
+    # *** Use ptype-aware advice ***
+    note, tips = dominant_note_and_tips(row.get("type",""), perc)
+
     flow.append(Paragraph("<b>Short interpretation</b>", styles["Heading3"]))
     flow.append(Paragraph(note, styles["BodyText"]))
-    flow.append(Spacer(1, 0.2 * cm))
+    flow.append(Spacer(1, 0.2*cm))
     flow.append(Paragraph("<b>General recommendations</b>", styles["Heading3"]))
     for tip in tips:
         flow.append(Paragraph(f"• {tip}", styles["BodyText"]))
-    flow.append(Spacer(1, 0.6 * cm))
+    flow.append(Spacer(1, 0.6*cm))
 
     flow.append(Paragraph("<b>Disclaimer</b>", styles["Heading3"]))
     flow.append(Paragraph(DISCLAIMER, styles["BodyText"]))
@@ -553,20 +455,10 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     doc.build(flow, onFirstPage=page_decor, onLaterPages=page_decor)
     return buff.getvalue()
 
-
 # -------------------------
-# APP
+# LOGGING + FEEDBACK HELPERS
 # -------------------------
-st.set_page_config(page_title="Kakunje Prakriti App", layout="wide", page_icon="🪷")
-st.title("🪷 Prakriti Analyzer — Weighted + PDF (15 Questions)")
-
-# Session + app open log
-if "session_id" not in st.session_state:
-    st.session_state.session_id = f"sess-{int(time.time()*1000)}"
-
-
 def _append_row_csv(row: dict, path: Path, cols: list[str]):
-    """Append a single row dict to CSV, creating it if needed, in a safe way."""
     try:
         if path.exists():
             df = pd.read_csv(path, on_bad_lines="skip")
@@ -579,9 +471,7 @@ def _append_row_csv(row: dict, path: Path, cols: list[str]):
     except Exception as e:
         st.sidebar.warning(f"Write to {path.name} skipped: {e}")
 
-
 def log_usage(event: str, payload: dict | None = None):
-    """Very simple usage log (timestamp, event, and a few fields if present)."""
     p = payload or {}
     row = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -594,53 +484,45 @@ def log_usage(event: str, payload: dict | None = None):
         "state": p.get("state"),
         "city": p.get("city"),
     }
-    _append_row_csv(
-        row,
-        USAGE_LOG_CSV,
-        [
-            "timestamp",
-            "event",
-            "name",
-            "gender",
-            "age",
-            "type",
-            "country",
-            "state",
-            "city",
-        ],
+    _append_row_csv(row, USAGE_LOG_CSV,
+        ["timestamp","event","name","gender","age","type","country","state","city"]
     )
 
-
-# Log app open (no PII; no location)
+# Session id & app open log
+if "session_id" not in st.session_state:
+    st.session_state.session_id = f"sess-{int(time.time()*1000)}"
 log_usage("app_open", {})
+
+# -------------------------
+# APP UI
+# -------------------------
+st.title("🪷 Prakriti Analyzer — By Kakunje Ayurveda")
 
 mode = st.sidebar.radio("Mode", ["Assessment", "Admin"], horizontal=True)
 
-# ---------- ASSESSMENT ----------
+# ===== ASSESSMENT =====
 if mode == "Assessment":
     with st.form("prakriti_form"):
         st.subheader("👤 Basic details")
         c = st.columns(3)
-        name = c[0].text_input("Name")
-        age = c[1].number_input("Age", min_value=5, max_value=120, value=30)
+        name   = c[0].text_input("Name")
+        age    = c[1].number_input("Age", min_value=5, max_value=120, value=30)
         gender = c[2].selectbox("Gender", ["Male", "Female", "Other"])
 
         st.markdown("---")
         st.subheader("📍 Optional: Location (helps us understand usage)")
         c2 = st.columns(3)
         country = c2[0].text_input("Country (optional)")
-        state = c2[1].text_input("State/Region (optional)")
-        city = c2[2].text_input("City (optional)")
+        state   = c2[1].text_input("State/Region (optional)")
+        city    = c2[2].text_input("City (optional)")
         consent = st.checkbox(
             "Share anonymous usage analytics (location & basic stats)",
             value=False,
-            help="If checked, we log anonymous usage events with the location you typed above.",
+            help="If checked, we log anonymous usage events with the location you typed above."
         )
 
         st.markdown("---")
-        st.subheader(
-            "📝 For each question, pick **tendency** (V/P/K) and **intensity**"
-        )
+        st.subheader("📝 For each question, pick tendency (V/P/K) and intensity")
 
         scores = {"Vata": 0.0, "Pitta": 0.0, "Kapha": 0.0}
         unanswered = 0
@@ -650,20 +532,11 @@ if mode == "Assessment":
             cols = st.columns([3, 2])
             choice = cols[0].radio(
                 "Tendency",
-                options=[
-                    f"{opts['Vata']} (Vata)",
-                    f"{opts['Pitta']} (Pitta)",
-                    f"{opts['Kapha']} (Kapha)",
-                ],
-                index=None,
-                key=f"q{idx}_dosha",
-                label_visibility="collapsed",
+                options=[f"{opts['Vata']} (Vata)", f"{opts['Pitta']} (Pitta)", f"{opts['Kapha']} (Kapha)"],
+                index=None, key=f"q{idx}_dosha", label_visibility="collapsed"
             )
             intensity = cols[1].selectbox(
-                "Intensity",
-                options=intensity_labels_for(cat),
-                index=1,
-                key=f"q{idx}_intensity",
+                "Intensity", options=intensity_labels_for(cat), index=1, key=f"q{idx}_intensity"
             )
             st.caption(f"Question weight: {q_w}×")
             st.divider()
@@ -671,7 +544,7 @@ if mode == "Assessment":
             if choice is None or intensity is None:
                 unanswered += 1
             else:
-                base = INT_TO_WEIGHT[intensity]  # 0/1/2
+                base = INT_TO_WEIGHT[intensity]
                 delta = base * float(q_w)
                 if choice.endswith("(Vata)"):
                     scores["Vata"] += delta
@@ -703,22 +576,18 @@ if mode == "Assessment":
             st.json(perc)
             st.success(f"**Type (heuristic):** {ptype}  |  **Attempt:** {attempt_no}")
             if unanswered:
-                st.caption(
-                    f"⚠️ {unanswered} item(s) unanswered; baseline improves with repeated attempts."
-                )
+                st.caption(f"⚠️ {unanswered} item(s) unanswered; baseline improves with repeated attempts.")
         with c2:
             fig, ax = plt.subplots()
-            ax.bar(
-                ["Vata", "Pitta", "Kapha"], [perc["Vata"], perc["Pitta"], perc["Kapha"]]
-            )
+            ax.bar(["Vata","Pitta","Kapha"], [perc["Vata"], perc["Pitta"], perc["Kapha"]])
             ax.set_ylim(0, 100)
             ax.set_ylabel("Percent")
             ax.set_title("Prakriti Composition")
             chart_path = REPORTS_DIR / f"chart_{int(time.time())}.png"
             fig.savefig(chart_path, bbox_inches="tight", dpi=200)
-            st.pyplot(fig, width="stretch")
+            st.pyplot(fig, width='stretch')
 
-        # Save the result row (includes location + consent)
+        # Save row
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "person_key": key,
@@ -733,76 +602,43 @@ if mode == "Assessment":
             "vata_score": round(scores["Vata"], 3),
             "pitta_score": round(scores["Pitta"], 3),
             "kapha_score": round(scores["Kapha"], 3),
-            "vata_%": perc["Vata"],
-            "pitta_%": perc["Pitta"],
-            "kapha_%": perc["Kapha"],
-            "type": ptype,
+            "vata_%": perc["Vata"], "pitta_%": perc["Pitta"], "kapha_%": perc["Kapha"],
+            "type": ptype
         }
         save_result_row(row)
         st.caption(f"Saved to {RESULTS_CSV}")
 
-        # Usage log (only if consent)
+        # usage log if consented
         if consent:
-            log_usage(
-                "assessment_submitted",
-                {
-                    "name": name,
-                    "gender": gender,
-                    "age": age,
-                    "type": ptype,
-                    "country": country,
-                    "state": state,
-                    "city": city,
-                },
-            )
+            log_usage("assessment_submitted", {
+                "name": name, "gender": gender, "age": age, "type": ptype,
+                "country": country, "state": state, "city": city
+            })
 
-        # PDF for current attempt
+        # PDF for this attempt
         if not REPORTLAB_OK:
-            st.error("To enable PDF, install ReportLab:\n\n`pip install reportlab`")
+            st.error("To enable PDF, install ReportLab: pip install reportlab")
         else:
             try:
-                pdf_bytes = build_pdf_report(
-                    row,
-                    {
-                        "Vata": perc["Vata"],
-                        "Pitta": perc["Pitta"],
-                        "Kapha": perc["Kapha"],
-                    },
-                    chart_path,
-                )
-                file_name = f"Prakriti_Report_{row['name']}_{row['timestamp'].replace(':','-')}.pdf"
-                st.download_button(
-                    "📄 Download PDF report (this attempt)",
-                    data=pdf_bytes,
-                    file_name=file_name,
-                    mime="application/pdf",
-                )
+                note_perc = {"Vata": perc["Vata"], "Pitta": perc["Pitta"], "Kapha": perc["Kapha"]}
+                pdf_bytes = build_pdf_report(row, note_perc, chart_path)
+                fname = f"Prakriti_Report_{row['name']}_{row['timestamp'].replace(':','-')}.pdf"
+                st.download_button("📄 Download PDF report (this attempt)", data=pdf_bytes,
+                                   file_name=fname, mime="application/pdf")
                 if consent:
-                    log_usage(
-                        "pdf_downloaded",
-                        {
-                            "name": name,
-                            "gender": gender,
-                            "age": age,
-                            "type": ptype,
-                            "country": country,
-                            "state": state,
-                            "city": city,
-                        },
-                    )
+                    log_usage("pdf_downloaded", {
+                        "name": name, "gender": gender, "age": age, "type": ptype,
+                        "country": country, "state": state, "city": city
+                    })
             except Exception as e:
                 st.error(f"PDF generation failed: {e}")
 
-        # Feedback expander
+        # Feedback
         st.markdown("---")
         with st.expander("💬 Send feedback (for testing)"):
             fb_name = st.text_input("Your name (optional)", value=name or "")
-            fb_type = st.selectbox(
-                "Feedback type", ["Suggestion", "Bug", "Question", "Other"], index=0
-            )
-            fb_text = st.text_area(
-                "Your feedback (what to improve or what went wrong?)"
-            )
+            fb_type = st.selectbox("Feedback type", ["Suggestion", "Bug", "Question", "Other"], index=0)
+            fb_text = st.text_area("Your feedback (what to improve or what went wrong?)")
             if st.button("Submit feedback"):
                 fb_row = {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -811,34 +647,19 @@ if mode == "Assessment":
                     "feedback_type": fb_type,
                     "feedback": fb_text,
                     "result_type": ptype,
-                    "vata_%": perc["Vata"],
-                    "pitta_%": perc["Pitta"],
-                    "kapha_%": perc["Kapha"],
+                    "vata_%": perc["Vata"], "pitta_%": perc["Pitta"], "kapha_%": perc["Kapha"],
                     "country": (country or "").title(),
                     "state": (state or "").title(),
                     "city": (city or "").title(),
                 }
                 _append_row_csv(
-                    fb_row,
-                    FEEDBACK_CSV,
-                    [
-                        "timestamp",
-                        "session_id",
-                        "name",
-                        "feedback_type",
-                        "feedback",
-                        "result_type",
-                        "vata_%",
-                        "pitta_%",
-                        "kapha_%",
-                        "country",
-                        "state",
-                        "city",
-                    ],
+                    fb_row, FEEDBACK_CSV,
+                    ["timestamp","session_id","name","feedback_type","feedback","result_type",
+                     "vata_%","pitta_%","kapha_%","country","state","city"]
                 )
                 st.success("Thank you! Feedback recorded.")
 
-# ---------- ADMIN ----------
+# ===== ADMIN =====
 if mode == "Admin":
     pin = st.sidebar.text_input("Admin PIN", type="password")
     if pin != ADMIN_PIN:
@@ -851,42 +672,27 @@ if mode == "Admin":
     # Filters
     name_filter = st.sidebar.text_input("Search name contains")
     genders = df["gender"].dropna().unique().tolist()
-    gsel = st.sidebar.multiselect(
-        "Gender", options=genders, default=genders if genders else []
-    )
+    gsel = st.sidebar.multiselect("Gender", options=genders, default=genders if genders else [])
     types = df["type"].dropna().unique().tolist()
-    tsel = st.sidebar.multiselect(
-        "Prakriti type", options=types, default=types if types else []
-    )
+    tsel = st.sidebar.multiselect("Prakriti type", options=types, default=types if types else [])
     countries = sorted([x for x in df["country"].dropna().unique().tolist() if x])
-    csel = st.sidebar.multiselect(
-        "Country", options=countries, default=countries if countries else []
-    )
+    csel = st.sidebar.multiselect("Country", options=countries, default=countries if countries else [])
 
     q = df.copy()
-    if name_filter:
-        q = q[q["name"].fillna("").str.contains(name_filter, case=False)]
-    if gsel:
-        q = q[q["gender"].isin(gsel)]
-    if tsel:
-        q = q[q["type"].isin(tsel)]
-    if csel:
-        q = q[q["country"].isin(csel)]
+    if name_filter: q = q[q["name"].fillna("").str.contains(name_filter, case=False)]
+    if gsel:        q = q[q["gender"].isin(gsel)]
+    if tsel:        q = q[q["type"].isin(tsel)]
+    if csel:        q = q[q["country"].isin(csel)]
 
     st.subheader("Filtered Results")
-    st.dataframe(q.sort_values(["timestamp"], ascending=False), width="stretch")
+    st.dataframe(q.sort_values(["timestamp"], ascending=False), width='stretch')
 
     col = st.columns(5)
-    with col[0]:
-        st.metric("Records", len(q))
-    with col[1]:
-        st.metric("Avg Vata %", f"{q['vata_%'].mean():.1f}" if len(q) else "—")
-    with col[2]:
-        st.metric("Avg Pitta %", f"{q['pitta_%'].mean():.1f}" if len(q) else "—")
-    with col[3]:
-        st.metric("Avg Kapha %", f"{q['kapha_%'].mean():.1f}" if len(q) else "—")
-    with col[4]:
-        st.metric("Countries", q["country"].nunique() if len(q) else 0)
+    with col[0]: st.metric("Records", len(q))
+    with col[1]: st.metric("Avg Vata %",  f"{q['vata_%'].mean():.1f}" if len(q) else "—")
+    with col[2]: st.metric("Avg Pitta %", f"{q['pitta_%'].mean():.1f}" if len(q) else "—")
+    with col[3]: st.metric("Avg Kapha %", f"{q['kapha_%'].mean():.1f}" if len(q) else "—")
+    with col[4]: st.metric("Countries", q['country'].nunique() if len(q) else 0)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -894,143 +700,118 @@ if mode == "Admin":
         counts = q["type"].value_counts().sort_index()
         fig, ax = plt.subplots()
         if counts.empty:
-            ax.text(
-                0.5, 0.5, "No data to display (check filters)", ha="center", va="center"
-            )
+            ax.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center")
             ax.axis("off")
         else:
             counts.plot(kind="bar", ax=ax)
-            ax.set_ylabel("Count")
-            ax.set_xlabel("Type")
-            ax.grid(True, axis="y", alpha=0.3)
-        st.pyplot(fig, width="stretch")
+            ax.set_ylabel("Count"); ax.set_xlabel("Type"); ax.grid(True, axis="y", alpha=0.3)
+        st.pyplot(fig, width='stretch')
 
     with c2:
         st.markdown("**Average Dosha %**")
         fig2, ax2 = plt.subplots()
         if q.empty:
-            ax2.text(
-                0.5, 0.5, "No data to display (check filters)", ha="center", va="center"
-            )
+            ax2.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center")
             ax2.axis("off")
         else:
-            ax2.bar(
-                ["Vata", "Pitta", "Kapha"],
-                [q["vata_%"].mean(), q["pitta_%"].mean(), q["kapha_%"].mean()],
-            )
-            ax2.set_ylim(0, 100)
-            ax2.set_ylabel("Percent")
-            ax2.grid(True, axis="y", alpha=0.3)
-        st.pyplot(fig2, width="stretch")
+            ax2.bar(["Vata","Pitta","Kapha"], [
+                q["vata_%"].mean(), q["pitta_%"].mean(), q["kapha_%"].mean()
+            ])
+            ax2.set_ylim(0, 100); ax2.set_ylabel("Percent"); ax2.grid(True, axis="y", alpha=0.3)
+        st.pyplot(fig2, width='stretch')
 
     st.markdown("---")
     st.subheader("📄 Generate PDF for a past attempt")
-
     if q.empty:
         st.info("No records to export. Run an assessment first.")
     else:
         q_sorted = q.sort_values("timestamp", ascending=False).reset_index(drop=True)
         labels = [
             f"{i+1}. {r['name']} | {r['gender']} | Age {int(r['age']) if pd.notna(r['age']) else '—'} | "
-            f"{r['type']} | {pd.to_datetime(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S')} (Attempt {int(r['attempt_no']) if pd.notna(r['attempt_no']) else '—'})"
+            f"{r['type']} | {pd.to_datetime(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(Attempt {int(r['attempt_no']) if pd.notna(r['attempt_no']) else '—'})"
             for i, r in q_sorted.iterrows()
         ]
-        sel = st.selectbox(
-            "Select a record",
-            options=list(range(len(labels))),
-            format_func=lambda i: labels[i],
-        )
+        sel = st.selectbox("Select a record", options=list(range(len(labels))), format_func=lambda i: labels[i])
 
         if st.button("Generate PDF for selected record"):
             rec = q_sorted.iloc[int(sel)].to_dict()
-            perc_sel = {
-                "Vata": rec["vata_%"],
-                "Pitta": rec["pitta_%"],
-                "Kapha": rec["kapha_%"],
-            }
+            perc_sel = {"Vata": rec["vata_%"], "Pitta": rec["pitta_%"], "Kapha": rec["kapha_%"]}
 
             figx, axx = plt.subplots()
-            axx.bar(
-                ["Vata", "Pitta", "Kapha"],
-                [perc_sel["Vata"], perc_sel["Pitta"], perc_sel["Kapha"]],
-            )
-            axx.set_ylim(0, 100)
-            axx.set_ylabel("Percent")
-            axx.set_title("Prakriti Composition")
+            axx.bar(["Vata","Pitta","Kapha"], [perc_sel["Vata"], perc_sel["Pitta"], perc_sel["Kapha"]])
+            axx.set_ylim(0, 100); axx.set_ylabel("Percent"); axx.set_title("Prakriti Composition")
             chart_sel = REPORTS_DIR / f"chart_{int(time.time())}_sel.png"
             figx.savefig(chart_sel, bbox_inches="tight", dpi=200)
-            st.pyplot(figx, width="stretch")
+            st.pyplot(figx, width='stretch')
 
             if not REPORTLAB_OK:
-                st.error("To enable PDF, install ReportLab:\n\n`pip install reportlab`")
+                st.error("To enable PDF, install ReportLab: pip install reportlab")
             else:
                 try:
+                    # build_pdf_report calls dominant_note_and_tips with ptype-aware logic
                     pdf_bytes = build_pdf_report(rec, perc_sel, chart_sel)
                     fname = f"Prakriti_Report_{rec['name']}_{str(rec['timestamp']).replace(':','-')}.pdf"
-                    st.download_button(
-                        "📄 Download PDF (selected record)",
-                        data=pdf_bytes,
-                        file_name=fname,
-                        mime="application/pdf",
-                    )
+                    st.download_button("📄 Download PDF (selected record)", data=pdf_bytes,
+                                       file_name=fname, mime="application/pdf")
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
 
-    # ---------- Usage Analytics ----------
+    # ---- Feedback & Usage in Admin ----
     st.markdown("---")
-    st.subheader("📊 Usage Analytics (anonymous, consented only)")
+    st.subheader("📝 Feedback (testing)")
+    try:
+        if FEEDBACK_CSV.exists():
+            dff = pd.read_csv(FEEDBACK_CSV, on_bad_lines="skip")
+            st.dataframe(dff.sort_values("timestamp", ascending=False), width='stretch')
+            st.download_button(
+                "⬇️ Download feedback CSV",
+                data=dff.to_csv(index=False).encode("utf-8"),
+                file_name="feedback_export.csv", mime="text/csv"
+            )
+        else:
+            st.info("No feedback yet.")
+    except Exception as e:
+        st.warning(f"Could not load feedback: {e}")
 
+    st.subheader("📊 Usage Analytics (anonymous, consented only)")
     try:
         if USAGE_LOG_CSV.exists():
             ul = pd.read_csv(USAGE_LOG_CSV, on_bad_lines="skip")
-            # Per-day counts
             ul["timestamp"] = pd.to_datetime(ul["timestamp"], errors="coerce")
             ul["day"] = ul["timestamp"].dt.date
             per_day = ul.groupby("day")["event"].count()
 
-            # Top countries
             top_countries = ul["country"].fillna("").replace({"nan": ""})
             top_counts = top_countries[top_countries != ""].value_counts().head(10)
 
             mc1, mc2, mc3 = st.columns(3)
-            with mc1:
-                st.metric("Events logged", len(ul))
-            with mc2:
-                st.metric("Unique days", per_day.index.nunique())
-            with mc3:
-                st.metric(
-                    "Countries seen", top_countries[top_countries != ""].nunique()
-                )
+            with mc1: st.metric("Events logged", len(ul))
+            with mc2: st.metric("Unique days", per_day.index.nunique())
+            with mc3: st.metric("Countries seen", top_countries[top_countries != ""].nunique())
 
             figd, axd = plt.subplots()
             if per_day.empty:
-                axd.text(0.5, 0.5, "No events yet", ha="center", va="center")
-                axd.axis("off")
+                axd.text(0.5, 0.5, "No events yet", ha="center", va="center"); axd.axis("off")
             else:
                 per_day.plot(kind="bar", ax=axd)
-                axd.set_ylabel("Events")
-                axd.set_xlabel("Day")
-                axd.set_title("Events per day")
+                axd.set_ylabel("Events"); axd.set_xlabel("Day"); axd.set_title("Events per day")
                 axd.grid(True, axis="y", alpha=0.3)
-            st.pyplot(figd, width="stretch")
+            st.pyplot(figd, width='stretch')
 
             figc, axc = plt.subplots()
             if top_counts.empty:
-                axc.text(0.5, 0.5, "No country data yet", ha="center", va="center")
-                axc.axis("off")
+                axc.text(0.5, 0.5, "No country data yet", ha="center", va="center"); axc.axis("off")
             else:
                 top_counts.plot(kind="bar", ax=axc)
-                axc.set_ylabel("Events")
-                axc.set_xlabel("Country")
-                axc.set_title("Top countries")
+                axc.set_ylabel("Events"); axc.set_xlabel("Country"); axc.set_title("Top countries")
                 axc.grid(True, axis="y", alpha=0.3)
-            st.pyplot(figc, width="stretch")
+            st.pyplot(figc, width='stretch')
 
             st.download_button(
                 "⬇️ Download usage log CSV",
                 data=ul.to_csv(index=False).encode("utf-8"),
-                file_name="usage_log_export.csv",
-                mime="text/csv",
+                file_name="usage_log_export.csv", mime="text/csv"
             )
         else:
             st.info("No events logged yet.")
