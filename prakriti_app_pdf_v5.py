@@ -1,10 +1,5 @@
-# prakriti_app_pdf_v5.py  (v6 merged into v5 filename)
+# prakriti_app_pdf_v5.py  (v6+ consolidated in v5 filename)
 # Prakriti Analyzer — By Kakunje Ayurveda
-# - 15 clear questions (weighted)
-# - Location (country/state/city) + consented usage analytics
-# - Feedback form, Results CSV, Admin dashboard, PDF with logo, footer, note, tips, disclaimer
-# - Dual + Tridoshic advice supported
-# - Reads ADMIN_PIN from Streamlit Secrets (with local fallback)
 
 import os, io, time, warnings
 from pathlib import Path
@@ -55,7 +50,7 @@ FOOTER_TEXT = (
     "+91-9483697676 · kakunje.com · prasanna@kakunje.com"
 )
 
-# ---- Required columns (backward compatible) ----
+# Columns guaranteed in results CSV
 REQUIRED_COLS = [
     "timestamp","person_key","attempt_no","name","age","gender",
     "country","state","city","consent_analytics",
@@ -63,7 +58,9 @@ REQUIRED_COLS = [
     "vata_%","pitta_%","kapha_%","type"
 ]
 
-# ---- Question weights & labels ----
+# -------------------------
+# QUESTIONS, WEIGHTS
+# -------------------------
 INT_TO_WEIGHT = {
     "Rarely": 0, "Sometimes": 1, "Often": 2,           # variable
     "Low": 0, "Moderate": 1, "High": 2,                # psychological
@@ -361,7 +358,6 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
         base["Kapha"]["tips"],
     )
 
-
 # -------------------------
 # PDF
 # -------------------------
@@ -372,7 +368,9 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     buff = io.BytesIO()
     doc = SimpleDocTemplate(
         buff, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm, topMargin=2*cm, bottomMargin=1.5*cm
+        leftMargin=2*cm, rightMargin=2*cm,
+        topMargin=3.6*cm,             # increased to avoid header overlap
+        bottomMargin=1.6*cm
     )
     styles = getSampleStyleSheet()
     flow = []
@@ -403,7 +401,8 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     def page_decor(c, d):
         header(c, d); footer(c, d)
 
-    flow.append(Spacer(1, 2.2*cm))
+    # Small spacer (margin now provides most of the top space)
+    flow.append(Spacer(1, 0.6*cm))
 
     # Compact location line
     loc = ", ".join([x for x in [row.get("city",""), row.get("state",""), row.get("country","")] if x]) or "—"
@@ -446,7 +445,7 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
         flow.append(RLImage(str(chart_png), width=12*cm, height=7*cm))
         flow.append(Spacer(1, 0.6*cm))
 
-    # *** Use ptype-aware advice ***
+    # ptype-aware advice
     note, tips = dominant_note_and_tips(row.get("type",""), perc)
 
     flow.append(Paragraph("<b>Short interpretation</b>", styles["Heading3"]))
@@ -464,7 +463,7 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     return buff.getvalue()
 
 # -------------------------
-# LOGGING + FEEDBACK HELPERS
+# LOGGING, FEEDBACK, SESSION HELPERS
 # -------------------------
 def _append_row_csv(row: dict, path: Path, cols: list[str]):
     try:
@@ -496,7 +495,13 @@ def log_usage(event: str, payload: dict | None = None):
         ["timestamp","event","name","gender","age","type","country","state","city"]
     )
 
-# Session id & app open log
+def _set_last_result(ctx: dict):
+    st.session_state["last_result_ctx"] = ctx
+
+def _get_last_result() -> dict | None:
+    return st.session_state.get("last_result_ctx")
+
+# Session id & first log
 if "session_id" not in st.session_state:
     st.session_state.session_id = f"sess-{int(time.time()*1000)}"
 log_usage("app_open", {})
@@ -624,15 +629,16 @@ if mode == "Assessment":
             })
 
         # PDF for this attempt
+        pdf_bytes, fname = None, None
         if not REPORTLAB_OK:
-            st.error("To enable PDF, install ReportLab: pip install reportlab")
+            st.info("Install ReportLab to enable PDF (pip install reportlab).")
         else:
             try:
                 note_perc = {"Vata": perc["Vata"], "Pitta": perc["Pitta"], "Kapha": perc["Kapha"]}
                 pdf_bytes = build_pdf_report(row, note_perc, chart_path)
                 fname = f"Prakriti_Report_{row['name']}_{row['timestamp'].replace(':','-')}.pdf"
                 st.download_button("📄 Download PDF report (this attempt)", data=pdf_bytes,
-                                   file_name=fname, mime="application/pdf")
+                                   file_name=fname, mime="application/pdf", key="dl_current_pdf")
                 if consent:
                     log_usage("pdf_downloaded", {
                         "name": name, "gender": gender, "age": age, "type": ptype,
@@ -641,24 +647,50 @@ if mode == "Assessment":
             except Exception as e:
                 st.error(f"PDF generation failed: {e}")
 
-        # Feedback
+        # Persist this result so Download/Feedback don't disappear on rerun
+        _set_last_result({
+            "row": row, "perc": perc, "ptype": ptype,
+            "chart_path": str(chart_path),
+            "pdf_bytes": pdf_bytes, "pdf_name": fname
+        })
+
+    # Persistent actions for the last computed result
+    _last = _get_last_result()
+    if _last:
         st.markdown("---")
+        st.subheader("📄 Report & Feedback")
+
+        # Download (last attempt)
+        if REPORTLAB_OK and _last.get("pdf_bytes"):
+            st.download_button(
+                "📄 Download PDF report (last attempt)",
+                data=_last["pdf_bytes"],
+                file_name=_last["pdf_name"],
+                mime="application/pdf",
+                key="dl_last_pdf",
+            )
+        elif not REPORTLAB_OK:
+            st.info("Install ReportLab to enable PDF (pip install reportlab).")
+
+        # Feedback
         with st.expander("💬 Send feedback (for testing)"):
-            fb_name = st.text_input("Your name (optional)", value=name or "")
-            fb_type = st.selectbox("Feedback type", ["Suggestion", "Bug", "Question", "Other"], index=0)
-            fb_text = st.text_area("Your feedback (what to improve or what went wrong?)")
-            if st.button("Submit feedback"):
+            fb_name = st.text_input("Your name (optional)", value=_last["row"].get("name",""))
+            fb_type = st.selectbox("Feedback type", ["Suggestion","Bug","Question","Other"], index=0, key="fb_type_last")
+            fb_text = st.text_area("Your feedback", key="fb_text_last")
+            if st.button("Submit feedback", key="fb_submit_last"):
                 fb_row = {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "session_id": st.session_state.session_id,
                     "name": (fb_name or "").title(),
                     "feedback_type": fb_type,
                     "feedback": fb_text,
-                    "result_type": ptype,
-                    "vata_%": perc["Vata"], "pitta_%": perc["Pitta"], "kapha_%": perc["Kapha"],
-                    "country": (country or "").title(),
-                    "state": (state or "").title(),
-                    "city": (city or "").title(),
+                    "result_type": _last["ptype"],
+                    "vata_%": _last["perc"]["Vata"],
+                    "pitta_%": _last["perc"]["Pitta"],
+                    "kapha_%": _last["perc"]["Kapha"],
+                    "country": _last["row"].get("country",""),
+                    "state": _last["row"].get("state",""),
+                    "city": _last["row"].get("city",""),
                 }
                 _append_row_csv(
                     fb_row, FEEDBACK_CSV,
@@ -754,10 +786,9 @@ if mode == "Admin":
             st.pyplot(figx, width='stretch')
 
             if not REPORTLAB_OK:
-                st.error("To enable PDF, install ReportLab: pip install reportlab")
+                st.error("Install ReportLab to enable PDF (pip install reportlab).")
             else:
                 try:
-                    # build_pdf_report calls dominant_note_and_tips with ptype-aware logic
                     pdf_bytes = build_pdf_report(rec, perc_sel, chart_sel)
                     fname = f"Prakriti_Report_{rec['name']}_{str(rec['timestamp']).replace(':','-')}.pdf"
                     st.download_button("📄 Download PDF (selected record)", data=pdf_bytes,
@@ -812,7 +843,7 @@ if mode == "Admin":
                 axc.text(0.5, 0.5, "No country data yet", ha="center", va="center"); axc.axis("off")
             else:
                 top_counts.plot(kind="bar", ax=axc)
-                axc.set_ylabel("Events"); axc.set_xlabel("Country"); axc.set_title("Top countries")
+                axc.set_ylabel("Events"); axc.set_xlabel("Country"); axc.setTitle = "Top countries"
                 axc.grid(True, axis="y", alpha=0.3)
             st.pyplot(figc, width='stretch')
 
