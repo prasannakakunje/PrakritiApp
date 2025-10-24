@@ -310,7 +310,8 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
         seen, out = set(), []
         for t in tips:
             if t not in seen:
-                seen.add(t); out.append(t)
+                seen.add(t)
+                out.append(t)
         return notes, out
 
     p = ptype.lower()
@@ -341,18 +342,25 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
             tips.insert(0, extra[pair_key])
         return note, tips
 
-    # Dominant fallback
+    # Dominant fallback (Vata, Pitta, Kapha)
     if "vata" in p:
-        return ("Your Prakriti appears <b>Vata-dominant</b> — creative, quick, and adaptable. "
-                "Balance dryness, cold and variability with warm, moist foods and steady routines."),
-               base["Vata"]["tips"]
+        return (
+            "Your Prakriti appears <b>Vata-dominant</b> — creative, quick, and adaptable. "
+            "Balance dryness, cold and variability with warm, moist foods and steady routines.",
+            base["Vata"]["tips"],
+        )
     if "pitta" in p:
-        return ("Your Prakriti appears <b>Pitta-dominant</b> — energetic, focused, and driven. "
-                "Balance excess heat with cooling foods and calm routines."),
-               base["Pitta"]["tips"]
-    return ("Your Prakriti appears <b>Kapha-dominant</b> — steady, calm, and enduring. "
-            "Balance heaviness with warmth, lightness, and activity."),
-           base["Kapha"]["tips"]
+        return (
+            "Your Prakriti appears <b>Pitta-dominant</b> — energetic, focused, and driven. "
+            "Balance excess heat with cooling foods and calm routines.",
+            base["Pitta"]["tips"],
+        )
+    return (
+        "Your Prakriti appears <b>Kapha-dominant</b> — steady, calm, and enduring. "
+        "Balance heaviness with warmth, lightness, and activity.",
+        base["Kapha"]["tips"],
+    )
+
 
 # -------------------------
 # PDF
