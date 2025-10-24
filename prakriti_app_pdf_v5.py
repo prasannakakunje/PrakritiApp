@@ -1,14 +1,16 @@
-# prakriti_app_pdf_v5.py — Prakriti Analyzer (Weighted, 15 Qs, PDF, Final)
+# prakriti_app_pdf_v6.py — Prakriti Analyzer (Weighted, 15 Qs, PDF, Location + Usage Analytics)
 # Brand: Kakunje Ayurveda Clinic & Research Centre
 # -----------------------------------------------------------------------
-# Features
-#  • 15 clearer questions (less ambiguity), per-question weights
-#  • Adaptive intensity labels (physical / variable / psychological)
-#  • Safe CSV writes (atomic) to data/prakriti_results.csv
-#  • Timestamp dtype fix + pandas groupby (new/old versions)
-#  • Admin dashboard: filters, charts, and "Generate PDF for past attempt"
-#  • PDF with logo header, clinic footer, short note, recommendations, disclaimer
-#  • Streamlit ≥2025 compliant (st.pyplot(..., width='stretch'))
+# New in v6:
+#  • Optional location fields (country/state/city) with explicit consent
+#  • Usage logging (app_open, assessment_submitted, pdf_downloaded)
+#  • Admin: Usage Analytics (top countries, per-day counts, quick metrics)
+#  • Reads ADMIN_PIN from secrets
+# Existing features kept:
+#  • 15 clear questions, weighted
+#  • Safe CSV writes; pandas-version-proof groupby
+#  • PDF with logo header, footer, note, tips, disclaimer
+#  • Streamlit 2025+ safe (width='stretch')
 # -----------------------------------------------------------------------
 
 import os, time, io, warnings
@@ -20,7 +22,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# Optional (but recommended) to keep console clean
+# Optional (keeps console clean)
 warnings.filterwarnings("ignore")
 
 # PDF dependency
@@ -45,19 +47,23 @@ except Exception:
 # CONFIG
 # -------------------------
 BRAND_TITLE = "Kakunje Ayurveda Clinic & Research Centre"
-LOGO_PATH = Path("logo.png")  # put your logo file in same folder as this .py
+LOGO_PATH = Path("logo.png")  # place your logo file in same folder
 DATA_DIR = Path("data")
 REPORTS_DIR = DATA_DIR / "reports"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 RESULTS_CSV = DATA_DIR / "prakriti_results.csv"
-ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234")
-# change if needed
+FEEDBACK_CSV = DATA_DIR / "feedback.csv"
+USAGE_LOG_CSV = DATA_DIR / "usage_log.csv"
 
-# --- Footer text for PDF reports (your final details) ---
+# Read PIN from secrets; fallback only for local
+ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234")
+
+# --- PDF footer text (final details) ---
 FOOTER_TEXT = "Kakunje Ayurveda Clinic & Research Centre · Moodubidri, Karnataka, India · +91-9483697676 · kakunje.com · prasanna@kakunje.com"
 
+# Required columns (extended with location + consent; backward-compatible)
 REQUIRED_COLS = [
     "timestamp",
     "person_key",
@@ -65,6 +71,10 @@ REQUIRED_COLS = [
     "name",
     "age",
     "gender",
+    "country",
+    "state",
+    "city",
+    "consent_analytics",
     "vata_score",
     "pitta_score",
     "kapha_score",
@@ -325,6 +335,8 @@ def load_results() -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["name"] = df["name"].astype(str).str.strip().str.title()
     df["gender"] = df["gender"].astype(str).str.strip().str.title()
+    for cc in ["country", "state", "city", "consent_analytics"]:
+        df[cc] = df[cc].astype(str).replace({"nan": ""})
     df = df.dropna(subset=["timestamp"])
     df = df.sort_values(["person_key", "timestamp"])
     return df
@@ -472,10 +484,19 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     # Body
     flow.append(Spacer(1, 2.2 * cm))
 
+    # Location line (compact)
+    loc_parts = [
+        x
+        for x in [row.get("city", ""), row.get("state", ""), row.get("country", "")]
+        if x
+    ]
+    loc_line = ", ".join(loc_parts) if loc_parts else "—"
+
     meta = [
         ["Name", row.get("name", "")],
         ["Age", str(row.get("age", ""))],
         ["Gender", row.get("gender", "")],
+        ["Location", loc_line],
         ["Date/Time", row.get("timestamp", "")],
         ["Attempt #", str(row.get("attempt_no", ""))],
         ["Type (heuristic)", row.get("type", "")],
@@ -536,8 +557,62 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
 # -------------------------
 # APP
 # -------------------------
-st.set_page_config(page_title="Prakriti Analyzer — PDF", layout="wide")
-st.title("🪷 Prakriti Analyzer — By Kakunje Ayurveda")
+st.set_page_config(page_title="Kakunje Prakriti App", layout="wide", page_icon="🪷")
+st.title("🪷 Prakriti Analyzer — Weighted + PDF (15 Questions)")
+
+# Session + app open log
+if "session_id" not in st.session_state:
+    st.session_state.session_id = f"sess-{int(time.time()*1000)}"
+
+
+def _append_row_csv(row: dict, path: Path, cols: list[str]):
+    """Append a single row dict to CSV, creating it if needed, in a safe way."""
+    try:
+        if path.exists():
+            df = pd.read_csv(path, on_bad_lines="skip")
+        else:
+            df = pd.DataFrame(columns=cols)
+        for c in cols:
+            row.setdefault(c, None)
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        _safe_write_csv(df[cols], path)
+    except Exception as e:
+        st.sidebar.warning(f"Write to {path.name} skipped: {e}")
+
+
+def log_usage(event: str, payload: dict | None = None):
+    """Very simple usage log (timestamp, event, and a few fields if present)."""
+    p = payload or {}
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        "name": p.get("name"),
+        "gender": p.get("gender"),
+        "age": p.get("age"),
+        "type": p.get("type"),
+        "country": p.get("country"),
+        "state": p.get("state"),
+        "city": p.get("city"),
+    }
+    _append_row_csv(
+        row,
+        USAGE_LOG_CSV,
+        [
+            "timestamp",
+            "event",
+            "name",
+            "gender",
+            "age",
+            "type",
+            "country",
+            "state",
+            "city",
+        ],
+    )
+
+
+# Log app open (no PII; no location)
+log_usage("app_open", {})
 
 mode = st.sidebar.radio("Mode", ["Assessment", "Admin"], horizontal=True)
 
@@ -549,6 +624,18 @@ if mode == "Assessment":
         name = c[0].text_input("Name")
         age = c[1].number_input("Age", min_value=5, max_value=120, value=30)
         gender = c[2].selectbox("Gender", ["Male", "Female", "Other"])
+
+        st.markdown("---")
+        st.subheader("📍 Optional: Location (helps us understand usage)")
+        c2 = st.columns(3)
+        country = c2[0].text_input("Country (optional)")
+        state = c2[1].text_input("State/Region (optional)")
+        city = c2[2].text_input("City (optional)")
+        consent = st.checkbox(
+            "Share anonymous usage analytics (location & basic stats)",
+            value=False,
+            help="If checked, we log anonymous usage events with the location you typed above.",
+        )
 
         st.markdown("---")
         st.subheader(
@@ -631,6 +718,7 @@ if mode == "Assessment":
             fig.savefig(chart_path, bbox_inches="tight", dpi=200)
             st.pyplot(fig, width="stretch")
 
+        # Save the result row (includes location + consent)
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "person_key": key,
@@ -638,6 +726,10 @@ if mode == "Assessment":
             "name": (name or "").title(),
             "age": age,
             "gender": (gender or "").title(),
+            "country": (country or "").title(),
+            "state": (state or "").title(),
+            "city": (city or "").title(),
+            "consent_analytics": bool(consent),
             "vata_score": round(scores["Vata"], 3),
             "pitta_score": round(scores["Pitta"], 3),
             "kapha_score": round(scores["Kapha"], 3),
@@ -648,6 +740,21 @@ if mode == "Assessment":
         }
         save_result_row(row)
         st.caption(f"Saved to {RESULTS_CSV}")
+
+        # Usage log (only if consent)
+        if consent:
+            log_usage(
+                "assessment_submitted",
+                {
+                    "name": name,
+                    "gender": gender,
+                    "age": age,
+                    "type": ptype,
+                    "country": country,
+                    "state": state,
+                    "city": city,
+                },
+            )
 
         # PDF for current attempt
         if not REPORTLAB_OK:
@@ -670,8 +777,66 @@ if mode == "Assessment":
                     file_name=file_name,
                     mime="application/pdf",
                 )
+                if consent:
+                    log_usage(
+                        "pdf_downloaded",
+                        {
+                            "name": name,
+                            "gender": gender,
+                            "age": age,
+                            "type": ptype,
+                            "country": country,
+                            "state": state,
+                            "city": city,
+                        },
+                    )
             except Exception as e:
                 st.error(f"PDF generation failed: {e}")
+
+        # Feedback expander
+        st.markdown("---")
+        with st.expander("💬 Send feedback (for testing)"):
+            fb_name = st.text_input("Your name (optional)", value=name or "")
+            fb_type = st.selectbox(
+                "Feedback type", ["Suggestion", "Bug", "Question", "Other"], index=0
+            )
+            fb_text = st.text_area(
+                "Your feedback (what to improve or what went wrong?)"
+            )
+            if st.button("Submit feedback"):
+                fb_row = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "session_id": st.session_state.session_id,
+                    "name": (fb_name or "").title(),
+                    "feedback_type": fb_type,
+                    "feedback": fb_text,
+                    "result_type": ptype,
+                    "vata_%": perc["Vata"],
+                    "pitta_%": perc["Pitta"],
+                    "kapha_%": perc["Kapha"],
+                    "country": (country or "").title(),
+                    "state": (state or "").title(),
+                    "city": (city or "").title(),
+                }
+                _append_row_csv(
+                    fb_row,
+                    FEEDBACK_CSV,
+                    [
+                        "timestamp",
+                        "session_id",
+                        "name",
+                        "feedback_type",
+                        "feedback",
+                        "result_type",
+                        "vata_%",
+                        "pitta_%",
+                        "kapha_%",
+                        "country",
+                        "state",
+                        "city",
+                    ],
+                )
+                st.success("Thank you! Feedback recorded.")
 
 # ---------- ADMIN ----------
 if mode == "Admin":
@@ -693,6 +858,10 @@ if mode == "Admin":
     tsel = st.sidebar.multiselect(
         "Prakriti type", options=types, default=types if types else []
     )
+    countries = sorted([x for x in df["country"].dropna().unique().tolist() if x])
+    csel = st.sidebar.multiselect(
+        "Country", options=countries, default=countries if countries else []
+    )
 
     q = df.copy()
     if name_filter:
@@ -701,11 +870,13 @@ if mode == "Admin":
         q = q[q["gender"].isin(gsel)]
     if tsel:
         q = q[q["type"].isin(tsel)]
+    if csel:
+        q = q[q["country"].isin(csel)]
 
     st.subheader("Filtered Results")
     st.dataframe(q.sort_values(["timestamp"], ascending=False), width="stretch")
 
-    col = st.columns(4)
+    col = st.columns(5)
     with col[0]:
         st.metric("Records", len(q))
     with col[1]:
@@ -714,6 +885,8 @@ if mode == "Admin":
         st.metric("Avg Pitta %", f"{q['pitta_%'].mean():.1f}" if len(q) else "—")
     with col[3]:
         st.metric("Avg Kapha %", f"{q['kapha_%'].mean():.1f}" if len(q) else "—")
+    with col[4]:
+        st.metric("Countries", q["country"].nunique() if len(q) else 0)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -756,7 +929,6 @@ if mode == "Admin":
     if q.empty:
         st.info("No records to export. Run an assessment first.")
     else:
-        # Build a simple selector with readable labels
         q_sorted = q.sort_values("timestamp", ascending=False).reset_index(drop=True)
         labels = [
             f"{i+1}. {r['name']} | {r['gender']} | Age {int(r['age']) if pd.notna(r['age']) else '—'} | "
@@ -777,7 +949,6 @@ if mode == "Admin":
                 "Kapha": rec["kapha_%"],
             }
 
-            # Build a temporary chart for this record
             figx, axx = plt.subplots()
             axx.bar(
                 ["Vata", "Pitta", "Kapha"],
@@ -804,3 +975,64 @@ if mode == "Admin":
                     )
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
+
+    # ---------- Usage Analytics ----------
+    st.markdown("---")
+    st.subheader("📊 Usage Analytics (anonymous, consented only)")
+
+    try:
+        if USAGE_LOG_CSV.exists():
+            ul = pd.read_csv(USAGE_LOG_CSV, on_bad_lines="skip")
+            # Per-day counts
+            ul["timestamp"] = pd.to_datetime(ul["timestamp"], errors="coerce")
+            ul["day"] = ul["timestamp"].dt.date
+            per_day = ul.groupby("day")["event"].count()
+
+            # Top countries
+            top_countries = ul["country"].fillna("").replace({"nan": ""})
+            top_counts = top_countries[top_countries != ""].value_counts().head(10)
+
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                st.metric("Events logged", len(ul))
+            with mc2:
+                st.metric("Unique days", per_day.index.nunique())
+            with mc3:
+                st.metric(
+                    "Countries seen", top_countries[top_countries != ""].nunique()
+                )
+
+            figd, axd = plt.subplots()
+            if per_day.empty:
+                axd.text(0.5, 0.5, "No events yet", ha="center", va="center")
+                axd.axis("off")
+            else:
+                per_day.plot(kind="bar", ax=axd)
+                axd.set_ylabel("Events")
+                axd.set_xlabel("Day")
+                axd.set_title("Events per day")
+                axd.grid(True, axis="y", alpha=0.3)
+            st.pyplot(figd, width="stretch")
+
+            figc, axc = plt.subplots()
+            if top_counts.empty:
+                axc.text(0.5, 0.5, "No country data yet", ha="center", va="center")
+                axc.axis("off")
+            else:
+                top_counts.plot(kind="bar", ax=axc)
+                axc.set_ylabel("Events")
+                axc.set_xlabel("Country")
+                axc.set_title("Top countries")
+                axc.grid(True, axis="y", alpha=0.3)
+            st.pyplot(figc, width="stretch")
+
+            st.download_button(
+                "⬇️ Download usage log CSV",
+                data=ul.to_csv(index=False).encode("utf-8"),
+                file_name="usage_log_export.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No events logged yet.")
+    except Exception as e:
+        st.warning(f"Could not load usage analytics: {e}")
