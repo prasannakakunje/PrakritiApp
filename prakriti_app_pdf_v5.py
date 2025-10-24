@@ -1,7 +1,7 @@
-# prakriti_app_pdf_v5.py  (v6+ consolidated in v5 filename)
+# prakriti_app_pdf_v5.py  (consolidated latest)
 # Prakriti Analyzer — By Kakunje Ayurveda
 
-import os, io, time, warnings
+import os, io, time, json, warnings
 from pathlib import Path
 from datetime import datetime
 
@@ -38,11 +38,11 @@ REPORTS_DIR = DATA_DIR / "reports"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-RESULTS_CSV   = DATA_DIR / "prakriti_results.csv"
-FEEDBACK_CSV  = DATA_DIR / "feedback.csv"
-USAGE_LOG_CSV = DATA_DIR / "usage_log.csv"
+RESULTS_CSV    = DATA_DIR / "prakriti_results.csv"
+FEEDBACK_CSV   = DATA_DIR / "feedback.csv"
+USAGE_LOG_CSV  = DATA_DIR / "usage_log.csv"
+CONFIG_JSON    = DATA_DIR / "config.json"
 
-# Read from secrets in cloud; fallback for local runs
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", "1234")
 
 FOOTER_TEXT = (
@@ -50,13 +50,15 @@ FOOTER_TEXT = (
     "+91-9483697676 · kakunje.com · prasanna@kakunje.com"
 )
 
-# Columns guaranteed in results CSV
 REQUIRED_COLS = [
     "timestamp","person_key","attempt_no","name","age","gender",
     "country","state","city","consent_analytics",
     "vata_score","pitta_score","kapha_score",
     "vata_%","pitta_%","kapha_%","type"
 ]
+
+# === Classification threshold defaults ===
+THRESHOLD_DEFAULTS = {"TRI_GAP": 5.0, "DUAL_GAP": 7.0, "DUAL_MIN": 30.0}
 
 # -------------------------
 # QUESTIONS, WEIGHTS
@@ -73,85 +75,71 @@ QUESTIONS = [
       "Pitta": "Medium/muscular; moderate weight",
       "Kapha": "Broad/heavier; gains easily"},
      "physical", 1.0),
-
     ("Skin baseline (without products)",
      {"Vata": "Dry/rough/cool",
       "Pitta": "Warm/sensitive; redness possible",
       "Kapha": "Smooth/thick/oily"},
      "physical", 1.0),
-
     ("Hair & scalp tendency",
      {"Vata": "Dry hair/scalp; frizz",
       "Pitta": "Fine hair; early greying common",
       "Kapha": "Thick/lustrous; oily scalp"},
      "physical", 0.8),
-
     ("Appetite pattern (day to day)",
      {"Vata": "Irregular; sometimes low/sometimes high",
       "Pitta": "Strong/sharp; hungry on time",
       "Kapha": "Slow/steady; can skip meals"},
      "variable", 1.6),
-
     ("Digestion / bowel pattern",
      {"Vata": "Variable; gas/bloating common",
       "Pitta": "Fast; tendency to loose/acidic",
       "Kapha": "Slower; well-formed stools"},
      "variable", 1.3),
-
     ("Thirst & sweating",
      {"Vata": "Low thirst; minimal sweat",
       "Pitta": "High thirst; profuse sweat",
       "Kapha": "Moderate thirst; mild sweat"},
      "variable", 1.0),
-
     ("Thermal comfort",
      {"Vata": "Prefers warmth; dislikes cold",
       "Pitta": "Feels hot easily; prefers cool",
       "Kapha": "Comfortable with cool; dislikes damp cold"},
      "physical", 0.9),
-
     ("Sleep quality",
      {"Vata": "Light; wakes easily; mind active",
       "Pitta": "Moderate; heat/dreams may disturb",
       "Kapha": "Deep/heavy; longer duration"},
      "variable", 1.3),
-
     ("Mental focus (typical)",
      {"Vata": "Quick ideas; distractible",
       "Pitta": "Sharp focus; task-driven",
       "Kapha": "Steady; slower but consistent"},
      "psychological", 1.5),
-
     ("Emotional response under stress",
      {"Vata": "Worry/anxiety; overthinking",
       "Pitta": "Irritability/anger; impatience",
       "Kapha": "Withdrawal/attachment; lethargy"},
      "psychological", 1.4),
-
     ("Speech & pace",
      {"Vata": "Fast/variable; animated",
       "Pitta": "Clear/precise; firm",
       "Kapha": "Slow/steady; calm"},
      "variable", 0.8),
-
     ("Joints & movement",
      {"Vata": "Cracking/mobility; dryness",
       "Pitta": "Warm; occasional tenderness",
       "Kapha": "Stable/cushioned; less cracking"},
      "physical", 0.9),
-
     ("Food preferences",
      {"Vata": "Warm, oily, grounding foods",
       "Pitta": "Cooling/light foods; dislikes very spicy",
       "Kapha": "Light/warm/spicy foods; dislikes heavy"},
      "variable", 1.0),
-
     ("Weather preference",
      {"Vata": "Warm/dry climate",
       "Pitta": "Cool/mild climate",
       "Kapha": "Cold/dry climate with sunshine"},
      "variable", 0.7),
-
     ("Typical energy pattern",
      {"Vata": "Variable energy; bursts and dips",
       "Pitta": "Strong/consistent until late crash",
@@ -163,6 +151,31 @@ DISCLAIMER = (
     "This assessment is educational and not a medical diagnosis. "
     "Please consult a qualified Ayurveda physician for personalized advice and treatment."
 )
+
+# -------------------------
+# CONFIG PERSISTENCE
+# -------------------------
+def load_config() -> dict:
+    cfg = THRESHOLD_DEFAULTS.copy()
+    if CONFIG_JSON.exists():
+        try:
+            on_disk = json.loads(CONFIG_JSON.read_text(encoding="utf-8"))
+            for k in THRESHOLD_DEFAULTS:
+                if k in on_disk:
+                    cfg[k] = float(on_disk[k])
+        except Exception:
+            pass
+    return cfg
+
+def save_config(cfg: dict):
+    try:
+        CONFIG_JSON.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception as e:
+        st.sidebar.warning(f"Could not save config: {e}")
+
+# seed session with config on first load
+if "config" not in st.session_state:
+    st.session_state.config = load_config()
 
 # -------------------------
 # SMALL HELPERS
@@ -181,15 +194,35 @@ def percentify(scores: dict) -> dict:
     total = sum(scores.values()) or 1
     return {k: round(100 * v / total, 1) for k, v in scores.items()}
 
+def get_thresholds():
+    cfg = st.session_state.config or THRESHOLD_DEFAULTS
+    try:
+        tri = float(cfg.get("TRI_GAP", THRESHOLD_DEFAULTS["TRI_GAP"]))
+        duo = float(cfg.get("DUAL_GAP", THRESHOLD_DEFAULTS["DUAL_GAP"]))
+        dmn = float(cfg.get("DUAL_MIN", THRESHOLD_DEFAULTS["DUAL_MIN"]))
+    except Exception:
+        tri, duo, dmn = THRESHOLD_DEFAULTS["TRI_GAP"], THRESHOLD_DEFAULTS["DUAL_GAP"], THRESHOLD_DEFAULTS["DUAL_MIN"]
+    return tri, duo, dmn
+
 def prakriti_type_from_percent(perc: dict) -> str:
+    """
+    Decide Dominant / Dual / Tridoshic from percent dict like {"Vata": 45.0, "Pitta": 46.0, "Kapha": 9.0}.
+    Uses live thresholds from config (persisted).
+    """
+    TRI_GAP, DUAL_GAP, DUAL_MIN = get_thresholds()
+
     items = sorted(perc.items(), key=lambda x: x[1], reverse=True)
-    top, mid, low = items[0][1], items[1][1], items[2][1]
-    CLOSE = 5.0
-    if abs(top - mid) <= CLOSE and abs(mid - low) <= CLOSE:
+    (d1, v1), (d2, v2), (d3, v3) = items
+
+    if max(v1, v2, v3) - min(v1, v2, v3) <= TRI_GAP:
         return "Tridoshic (V-P-K)"
-    if abs(top - mid) <= CLOSE:
-        return f"Dual ({items[0][0][0]}-{items[1][0][0]})"
-    return f"Dominant {items[0][0]}"
+
+    if abs(v1 - v2) <= DUAL_GAP and v1 >= DUAL_MIN and v2 >= DUAL_MIN:
+        pair = "".join(sorted([d1[0], d2[0]]))
+        mapping = {"VP": "V-P", "PV": "V-P", "VK": "V-K", "KV": "V-K", "PK": "P-K", "KP": "P-K"}
+        return f"Dual ({mapping.get(pair, d1[0] + '-' + d2[0])})"
+
+    return f"Dominant {d1}"
 
 # --- CSV IO (robust) ---
 def _flex_read_csv(path: Path) -> pd.DataFrame:
@@ -205,7 +238,7 @@ def _safe_write_csv(df: pd.DataFrame, path: Path) -> Path:
     tmp = path.with_suffix(".tmp")
     try:
         df.to_csv(tmp, index=False)
-        os.replace(tmp, path)  # atomic on Windows
+        os.replace(tmp, path)
         return path
     except PermissionError:
         alt = path.with_name(f"{path.stem}_new_{int(time.time())}.csv")
@@ -245,27 +278,20 @@ def save_result_row(row: dict):
     current["timestamp"] = pd.to_datetime(current["timestamp"], errors="coerce")
     current = current.dropna(subset=["timestamp"])
     current = current.sort_values(["person_key","timestamp"])
-
     def reassign(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("timestamp")
         g["attempt_no"] = range(1, len(g) + 1)
         return g
-
     try:
         current = current.groupby("person_key", group_keys=False, include_groups=False).apply(reassign)
     except TypeError:
         current = current.groupby("person_key", group_keys=False).apply(reassign)
-
     _safe_write_csv(current, RESULTS_CSV)
 
 # -------------------------
 # DUAL/TRIDOSHA ADVICE
 # -------------------------
 def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
-    """
-    Tailored (note, tips) for Dominant, Dual (V-P, V-K, P-K), or Tridoshic.
-    ptype examples: "Dominant Vata", "Dual (V-P)", "Tridoshic (V-P-K)".
-    """
     base = {
         "Vata": {
             "note": ("<b>Vata</b> qualities (light, dry, cool, mobile) are prominent. "
@@ -303,12 +329,10 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
         tips = []
         for d in doshas:
             tips += base[d]["tips"][:2]
-        # de-duplicate tips keeping order
         seen, out = set(), []
         for t in tips:
             if t not in seen:
-                seen.add(t)
-                out.append(t)
+                seen.add(t); out.append(t)
         return notes, out
 
     p = ptype.lower()
@@ -329,7 +353,7 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
         d1, d2 = m.get(d1i, d1i), m.get(d2i, d2i)
         note, tips = merge(d1, d2)
         note = f"Your Prakriti appears <b>Dual</b> — {d1} &amp; {d2}. {note}"
-        pair_key = "".join(sorted([d1[0], d2[0]]))  # "PV", "PK", "KV"
+        pair_key = "".join(sorted([d1[0], d2[0]]))
         extra = {
             "PV": "Choose warm but not overly heating foods; keep routines steady and cooling when needed.",
             "PK": "Keep meals light/warm and mildly spicy; avoid very oily/heavy foods and excessive heat.",
@@ -339,7 +363,6 @@ def dominant_note_and_tips(ptype: str, perc: dict) -> tuple[str, list[str]]:
             tips.insert(0, extra[pair_key])
         return note, tips
 
-    # Dominant fallback (Vata, Pitta, Kapha)
     if "vata" in p:
         return (
             "Your Prakriti appears <b>Vata-dominant</b> — creative, quick, and adaptable. "
@@ -369,13 +392,11 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
     doc = SimpleDocTemplate(
         buff, pagesize=A4,
         leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=3.6*cm,             # increased to avoid header overlap
-        bottomMargin=1.6*cm
+        topMargin=3.6*cm, bottomMargin=1.6*cm  # fixed header overlap
     )
     styles = getSampleStyleSheet()
     flow = []
 
-    # Header / Footer
     def header(c, d):
         w, h = A4
         c.saveState()
@@ -398,15 +419,11 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
         c.drawCentredString(w/2, 1.2*cm, FOOTER_TEXT)
         c.restoreState()
 
-    def page_decor(c, d):
-        header(c, d); footer(c, d)
+    def page_decor(c, d): header(c, d); footer(c, d)
 
-    # Small spacer (margin now provides most of the top space)
     flow.append(Spacer(1, 0.6*cm))
 
-    # Compact location line
     loc = ", ".join([x for x in [row.get("city",""), row.get("state",""), row.get("country","")] if x]) or "—"
-
     meta = [
         ["Name", row.get("name","")],
         ["Age", str(row.get("age",""))],
@@ -445,7 +462,6 @@ def build_pdf_report(row: dict, perc: dict, chart_png: Path) -> bytes:
         flow.append(RLImage(str(chart_png), width=12*cm, height=7*cm))
         flow.append(Spacer(1, 0.6*cm))
 
-    # ptype-aware advice
     note, tips = dominant_note_and_tips(row.get("type",""), perc)
 
     flow.append(Paragraph("<b>Short interpretation</b>", styles["Heading3"]))
@@ -495,11 +511,8 @@ def log_usage(event: str, payload: dict | None = None):
         ["timestamp","event","name","gender","age","type","country","state","city"]
     )
 
-def _set_last_result(ctx: dict):
-    st.session_state["last_result_ctx"] = ctx
-
-def _get_last_result() -> dict | None:
-    return st.session_state.get("last_result_ctx")
+def _set_last_result(ctx: dict): st.session_state["last_result_ctx"] = ctx
+def _get_last_result() -> dict | None: return st.session_state.get("last_result_ctx")
 
 # Session id & first log
 if "session_id" not in st.session_state:
@@ -510,7 +523,6 @@ log_usage("app_open", {})
 # APP UI
 # -------------------------
 st.title("🪷 Prakriti Analyzer — By Kakunje Ayurveda")
-
 mode = st.sidebar.radio("Mode", ["Assessment", "Admin"], horizontal=True)
 
 # ===== ASSESSMENT =====
@@ -559,19 +571,15 @@ if mode == "Assessment":
             else:
                 base = INT_TO_WEIGHT[intensity]
                 delta = base * float(q_w)
-                if choice.endswith("(Vata)"):
-                    scores["Vata"] += delta
-                elif choice.endswith("(Pitta)"):
-                    scores["Pitta"] += delta
-                elif choice.endswith("(Kapha)"):
-                    scores["Kapha"] += delta
+                if choice.endswith("(Vata)"):  scores["Vata"]  += delta
+                elif choice.endswith("(Pitta)"): scores["Pitta"] += delta
+                elif choice.endswith("(Kapha)"): scores["Kapha"] += delta
 
         submitted = st.form_submit_button("Compute Prakriti")
 
     if submitted:
         if sum(scores.values()) == 0:
-            st.warning("Please answer the questions.")
-            st.stop()
+            st.warning("Please answer the questions."); st.stop()
 
         perc = percentify(scores)
         ptype = prakriti_type_from_percent(perc)
@@ -581,6 +589,9 @@ if mode == "Assessment":
         attempt_no = int(len(df_existing[df_existing["person_key"] == key]) + 1)
 
         st.markdown("## 🔎 Result")
+        TRI_GAP, DUAL_GAP, DUAL_MIN = get_thresholds()
+        st.caption(f"Classification thresholds → Tridoshic ≤{TRI_GAP}%, Dual gap ≤{DUAL_GAP}% with both ≥{DUAL_MIN}%.")
+
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Weighted scores (with question multipliers)**")
@@ -593,49 +604,35 @@ if mode == "Assessment":
         with c2:
             fig, ax = plt.subplots()
             ax.bar(["Vata","Pitta","Kapha"], [perc["Vata"], perc["Pitta"], perc["Kapha"]])
-            ax.set_ylim(0, 100)
-            ax.set_ylabel("Percent")
-            ax.set_title("Prakriti Composition")
+            ax.set_ylim(0, 100); ax.set_ylabel("Percent"); ax.set_title("Prakriti Composition")
             chart_path = REPORTS_DIR / f"chart_{int(time.time())}.png"
             fig.savefig(chart_path, bbox_inches="tight", dpi=200)
             st.pyplot(fig, width='stretch')
 
-        # Save row
         row = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "person_key": key,
-            "attempt_no": attempt_no,
-            "name": (name or "").title(),
-            "age": age,
-            "gender": (gender or "").title(),
-            "country": (country or "").title(),
-            "state": (state or "").title(),
-            "city": (city or "").title(),
+            "person_key": key, "attempt_no": attempt_no,
+            "name": (name or "").title(), "age": age, "gender": (gender or "").title(),
+            "country": (country or "").title(), "state": (state or "").title(), "city": (city or "").title(),
             "consent_analytics": bool(consent),
-            "vata_score": round(scores["Vata"], 3),
-            "pitta_score": round(scores["Pitta"], 3),
-            "kapha_score": round(scores["Kapha"], 3),
-            "vata_%": perc["Vata"], "pitta_%": perc["Pitta"], "kapha_%": perc["Kapha"],
-            "type": ptype
+            "vata_score": round(scores["Vata"], 3), "pitta_score": round(scores["Pitta"], 3), "kapha_score": round(scores["Kapha"], 3),
+            "vata_%": perc["Vata"], "pitta_%": perc["Pitta"], "kapha_%": perc["Kapha"], "type": ptype
         }
         save_result_row(row)
         st.caption(f"Saved to {RESULTS_CSV}")
 
-        # usage log if consented
         if consent:
             log_usage("assessment_submitted", {
                 "name": name, "gender": gender, "age": age, "type": ptype,
                 "country": country, "state": state, "city": city
             })
 
-        # PDF for this attempt
         pdf_bytes, fname = None, None
         if not REPORTLAB_OK:
             st.info("Install ReportLab to enable PDF (pip install reportlab).")
         else:
             try:
-                note_perc = {"Vata": perc["Vata"], "Pitta": perc["Pitta"], "Kapha": perc["Kapha"]}
-                pdf_bytes = build_pdf_report(row, note_perc, chart_path)
+                pdf_bytes = build_pdf_report(row, {"Vata": perc["Vata"], "Pitta": perc["Pitta"], "Kapha": perc["Kapha"]}, chart_path)
                 fname = f"Prakriti_Report_{row['name']}_{row['timestamp'].replace(':','-')}.pdf"
                 st.download_button("📄 Download PDF report (this attempt)", data=pdf_bytes,
                                    file_name=fname, mime="application/pdf", key="dl_current_pdf")
@@ -647,32 +644,22 @@ if mode == "Assessment":
             except Exception as e:
                 st.error(f"PDF generation failed: {e}")
 
-        # Persist this result so Download/Feedback don't disappear on rerun
-        _set_last_result({
-            "row": row, "perc": perc, "ptype": ptype,
-            "chart_path": str(chart_path),
-            "pdf_bytes": pdf_bytes, "pdf_name": fname
-        })
+        _set_last_result({"row": row, "perc": perc, "ptype": ptype,
+                          "chart_path": str(chart_path), "pdf_bytes": pdf_bytes, "pdf_name": fname})
 
-    # Persistent actions for the last computed result
     _last = _get_last_result()
     if _last:
         st.markdown("---")
         st.subheader("📄 Report & Feedback")
-
-        # Download (last attempt)
         if REPORTLAB_OK and _last.get("pdf_bytes"):
             st.download_button(
                 "📄 Download PDF report (last attempt)",
-                data=_last["pdf_bytes"],
-                file_name=_last["pdf_name"],
-                mime="application/pdf",
-                key="dl_last_pdf",
+                data=_last["pdf_bytes"], file_name=_last["pdf_name"],
+                mime="application/pdf", key="dl_last_pdf",
             )
         elif not REPORTLAB_OK:
             st.info("Install ReportLab to enable PDF (pip install reportlab).")
 
-        # Feedback
         with st.expander("💬 Send feedback (for testing)"):
             fb_name = st.text_input("Your name (optional)", value=_last["row"].get("name",""))
             fb_type = st.selectbox("Feedback type", ["Suggestion","Bug","Question","Other"], index=0, key="fb_type_last")
@@ -682,15 +669,10 @@ if mode == "Assessment":
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "session_id": st.session_state.session_id,
                     "name": (fb_name or "").title(),
-                    "feedback_type": fb_type,
-                    "feedback": fb_text,
+                    "feedback_type": fb_type, "feedback": fb_text,
                     "result_type": _last["ptype"],
-                    "vata_%": _last["perc"]["Vata"],
-                    "pitta_%": _last["perc"]["Pitta"],
-                    "kapha_%": _last["perc"]["Kapha"],
-                    "country": _last["row"].get("country",""),
-                    "state": _last["row"].get("state",""),
-                    "city": _last["row"].get("city",""),
+                    "vata_%": _last["perc"]["Vata"], "pitta_%": _last["perc"]["Pitta"], "kapha_%": _last["perc"]["Kapha"],
+                    "country": _last["row"].get("country",""), "state": _last["row"].get("state",""), "city": _last["row"].get("city",""),
                 }
                 _append_row_csv(
                     fb_row, FEEDBACK_CSV,
@@ -703,13 +685,31 @@ if mode == "Assessment":
 if mode == "Admin":
     pin = st.sidebar.text_input("Admin PIN", type="password")
     if pin != ADMIN_PIN:
-        st.warning("Enter correct PIN to access Admin.")
-        st.stop()
+        st.warning("Enter correct PIN to access Admin."); st.stop()
 
+    # ---- Live thresholds (persisted) ----
+    st.sidebar.markdown("### Classification thresholds")
+    cfg = st.session_state.config
+    tri_gap  = st.sidebar.slider("TRI_GAP  (max spread between all three for Tridoshic)",
+                                 min_value=1.0, max_value=15.0, value=float(cfg["TRI_GAP"]), step=0.5)
+    dual_gap = st.sidebar.slider("DUAL_GAP (max gap between top two for Dual)",
+                                 min_value=1.0, max_value=15.0, value=float(cfg["DUAL_GAP"]), step=0.5)
+    dual_min = st.sidebar.slider("DUAL_MIN (minimum % both top doshas must meet)",
+                                 min_value=10.0, max_value=60.0, value=float(cfg["DUAL_MIN"]), step=1.0)
+
+    if (tri_gap, dual_gap, dual_min) != (cfg["TRI_GAP"], cfg["DUAL_GAP"], cfg["DUAL_MIN"]):
+        st.session_state.config = {"TRI_GAP": tri_gap, "DUAL_GAP": dual_gap, "DUAL_MIN": dual_min}
+        save_config(st.session_state.config)
+        st.sidebar.success("Thresholds saved. New assessments will use the updated values.")
+
+    st.info(f"Current thresholds → TRI_GAP: {st.session_state.config['TRI_GAP']}, "
+            f"DUAL_GAP: {st.session_state.config['DUAL_GAP']}, "
+            f"DUAL_MIN: {st.session_state.config['DUAL_MIN']}")
+
+    # ---- Results table & charts ----
     df = load_results()
     st.header("🧭 Admin — Results Browser")
 
-    # Filters
     name_filter = st.sidebar.text_input("Search name contains")
     genders = df["gender"].dropna().unique().tolist()
     gsel = st.sidebar.multiselect("Gender", options=genders, default=genders if genders else [])
@@ -740,8 +740,7 @@ if mode == "Admin":
         counts = q["type"].value_counts().sort_index()
         fig, ax = plt.subplots()
         if counts.empty:
-            ax.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center")
-            ax.axis("off")
+            ax.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center"); ax.axis("off")
         else:
             counts.plot(kind="bar", ax=ax)
             ax.set_ylabel("Count"); ax.set_xlabel("Type"); ax.grid(True, axis="y", alpha=0.3)
@@ -751,12 +750,9 @@ if mode == "Admin":
         st.markdown("**Average Dosha %**")
         fig2, ax2 = plt.subplots()
         if q.empty:
-            ax2.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center")
-            ax2.axis("off")
+            ax2.text(0.5, 0.5, "No data to display (check filters)", ha="center", va="center"); ax2.axis("off")
         else:
-            ax2.bar(["Vata","Pitta","Kapha"], [
-                q["vata_%"].mean(), q["pitta_%"].mean(), q["kapha_%"].mean()
-            ])
+            ax2.bar(["Vata","Pitta","Kapha"], [q["vata_%"].mean(), q["pitta_%"].mean(), q["kapha_%"].mean()])
             ax2.set_ylim(0, 100); ax2.set_ylabel("Percent"); ax2.grid(True, axis="y", alpha=0.3)
         st.pyplot(fig2, width='stretch')
 
@@ -796,18 +792,14 @@ if mode == "Admin":
                 except Exception as e:
                     st.error(f"PDF generation failed: {e}")
 
-    # ---- Feedback & Usage in Admin ----
     st.markdown("---")
     st.subheader("📝 Feedback (testing)")
     try:
         if FEEDBACK_CSV.exists():
             dff = pd.read_csv(FEEDBACK_CSV, on_bad_lines="skip")
             st.dataframe(dff.sort_values("timestamp", ascending=False), width='stretch')
-            st.download_button(
-                "⬇️ Download feedback CSV",
-                data=dff.to_csv(index=False).encode("utf-8"),
-                file_name="feedback_export.csv", mime="text/csv"
-            )
+            st.download_button("⬇️ Download feedback CSV", data=dff.to_csv(index=False).encode("utf-8"),
+                               file_name="feedback_export.csv", mime="text/csv")
         else:
             st.info("No feedback yet.")
     except Exception as e:
@@ -847,11 +839,9 @@ if mode == "Admin":
                 axc.grid(True, axis="y", alpha=0.3)
             st.pyplot(figc, width='stretch')
 
-            st.download_button(
-                "⬇️ Download usage log CSV",
-                data=ul.to_csv(index=False).encode("utf-8"),
-                file_name="usage_log_export.csv", mime="text/csv"
-            )
+            st.download_button("⬇️ Download usage log CSV",
+                               data=ul.to_csv(index=False).encode("utf-8"),
+                               file_name="usage_log_export.csv", mime="text/csv")
         else:
             st.info("No events logged yet.")
     except Exception as e:
